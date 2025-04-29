@@ -1,0 +1,4508 @@
+<?php
+/**
+ * Excel file processor
+ */
+class Excel_Processor {
+
+    /**
+     * Process the uploaded Excel file
+     */
+    public function process_excel_file($file_path, $allow_overwrite) {
+        $results = array();
+
+        try {
+            // Set increased time limits for large migrations
+            $this->increase_limits();
+            
+            // Check if file exists
+            if (!file_exists($file_path)) {
+                throw new Exception('File not found');
+            }
+            
+            // Get file info
+            $file_type = mime_content_type($file_path);
+            $file_extension = strtolower(pathinfo($file_path, PATHINFO_EXTENSION));
+            
+            error_log("MIGRATION: Processing file of type $file_type with extension $file_extension");
+            
+            // Process based on file type
+            if ($file_extension === 'csv' || $this->is_csv_file($file_path)) {
+                // Process CSV directly
+                $results = $this->process_csv_file($file_path, $allow_overwrite);
+            } 
+            elseif (
+                $file_extension === 'xlsx' || 
+                $file_type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+                $this->is_xlsx_file($file_path)
+            ) {
+                // Convert XLSX to CSV
+                $csv_file = $this->convert_xlsx_to_csv($file_path);
+                $results = $this->process_csv_file($csv_file, $allow_overwrite);
+                // Clean up temp file
+                if (file_exists($csv_file)) {
+                    unlink($csv_file);
+                }
+            } else {
+                throw new Exception("Unsupported file format: $file_type. Please use .xlsx or .csv files.");
+            }
+        } catch (Exception $e) {
+            error_log("MIGRATION ERROR: " . $e->getMessage());
+            
+            // Free any leftover locks or resources
+            $this->cleanup_after_error();
+            
+            // Add the error to results if possible
+            $results[] = array(
+                'status' => 'error',
+                'message' => $e->getMessage()
+            );
+            
+            throw new Exception($e->getMessage());
+        }
+        
+        return $results;
+    }
+    
+    /**
+     * Increase PHP limits for large migrations
+     */
+    private function increase_limits() {
+        // Increase PHP limits
+        @ini_set('memory_limit', '512M');
+        @ini_set('max_execution_time', '600'); // 5 minutes
+        @set_time_limit(600);
+        
+        // Also increase WordPress-specific limits
+        if (function_exists('wp_raise_memory_limit')) {
+            wp_raise_memory_limit('admin');
+        }
+        
+        // Log current limits
+        error_log("MIGRATION: Memory limit set to " . ini_get('memory_limit'));
+        error_log("MIGRATION: Max execution time set to " . ini_get('max_execution_time') . " seconds");
+        
+        // Disable WordPress revisions temporarily to save resources
+        if (!defined('WP_POST_REVISIONS')) {
+            define('WP_POST_REVISIONS', false);
+        }
+    }
+    
+    /**
+     * Check if a file is a CSV file by examining its content
+     */
+    private function is_csv_file($file_path) {
+        $handle = @fopen($file_path, 'r');
+        if (!$handle) {
+            return false;
+        }
+        
+        // Try to read the first line as CSV
+        $first_line = fgetcsv($handle);
+        fclose($handle);
+        
+        // If we got an array and it has multiple elements, it's likely a CSV file
+        return is_array($first_line) && count($first_line) > 1;
+    }
+    
+    /**
+     * Check if a file is an XLSX file by examining its content
+     */
+    private function is_xlsx_file($file_path) {
+        // XLSX files are ZIP archives with specific content
+        $signature = @file_get_contents($file_path, false, null, 0, 4);
+        
+        // Check for ZIP file signature (PK..)
+        if ($signature === "PK\x03\x04") {
+            try {
+                $zip = new ZipArchive();
+                if ($zip->open($file_path) === true) {
+                    // Check for specific Excel file structure
+                    $xlsx_files = [
+                        '[Content_Types].xml',
+                        'xl/workbook.xml',
+                        'xl/worksheets/sheet1.xml'
+                    ];
+                    
+                    $is_xlsx = true;
+                    foreach ($xlsx_files as $required_file) {
+                        if ($zip->locateName($required_file) === false) {
+                            $is_xlsx = false;
+                            break;
+                        }
+                    }
+                    
+                    $zip->close();
+                    return $is_xlsx;
+                }
+            } catch (Exception $e) {
+                error_log("MIGRATION WARNING: Error checking XLSX file: " . $e->getMessage());
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Convert XLSX to CSV using PhpSpreadsheet if available, otherwise fallback to ZIP approach
+     */
+    private function convert_xlsx_to_csv($xlsx_file) {
+        // Create temporary file for CSV output
+        $temp_csv = tempnam(sys_get_temp_dir(), 'csv_');
+        $temp_dir = null;
+        
+        // Try using PhpSpreadsheet if it's available (better handling of Excel files)
+        if (class_exists('PhpOffice\PhpSpreadsheet\IOFactory')) {
+            try {
+                error_log("MIGRATION: Using PhpSpreadsheet to convert Excel file");
+                $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($xlsx_file);
+                $writer = new \PhpOffice\PhpSpreadsheet\Writer\Csv($spreadsheet);
+                $writer->save($temp_csv);
+                return $temp_csv;
+            } catch (Exception $e) {
+                error_log("MIGRATION WARNING: PhpSpreadsheet failed, falling back to manual conversion. Error: " . $e->getMessage());
+                // Continue to fallback method
+            }
+        }
+        
+        // XLSX files are ZIP archives containing XML files
+        if (!class_exists('ZipArchive')) {
+            throw new Exception('ZipArchive extension is required to process Excel files');
+        }
+        
+        try {
+            error_log("MIGRATION: Using ZipArchive to convert Excel file");
+            // Extract Excel file contents
+            $zip = new ZipArchive();
+            if ($zip->open($xlsx_file) !== true) {
+                throw new Exception('Could not open Excel file');
+            }
+            
+            // Create a temporary directory
+            $temp_dir = tempnam(sys_get_temp_dir(), 'xlsx_');
+            if (file_exists($temp_dir)) {
+                unlink($temp_dir);
+            }
+            mkdir($temp_dir);
+            
+            // Extract files
+            $zip->extractTo($temp_dir);
+            $zip->close();
+            
+            // Load the sheet data
+            $sheet_file = $temp_dir . '/xl/worksheets/sheet1.xml';
+            if (!file_exists($sheet_file)) {
+                throw new Exception('Could not find sheet data in Excel file');
+            }
+            
+            // Load shared strings if available
+            $strings = array();
+            $shared_strings_file = $temp_dir . '/xl/sharedStrings.xml';
+            if (file_exists($shared_strings_file)) {
+                $xml = simplexml_load_file($shared_strings_file);
+                if ($xml && isset($xml->si)) {
+                    foreach ($xml->si as $si) {
+                        $strings[] = (string) $si->t;
+                    }
+                }
+            }
+            
+            // Parse the sheet
+            $sheet = simplexml_load_file($sheet_file);
+            if (!$sheet || !isset($sheet->sheetData)) {
+                throw new Exception('Could not read sheet data from Excel file');
+            }
+            
+            $rows = array();
+            
+            // Get all rows
+            foreach ($sheet->sheetData->row as $row) {
+                $row_index = (int) $row['r'];
+                $cells = array();
+                
+                // Get cells in this row
+                foreach ($row->c as $cell) {
+                    $cell_ref = (string) $cell['r'];
+                    $column = preg_replace('/[0-9]+/', '', $cell_ref);
+                    $col_index = $this->column_letter_to_index($column);
+                    
+                    // Get cell value
+                    $value = '';
+                    if (isset($cell->v)) {
+                        $value = (string) $cell->v;
+                        
+                        // Handle different data types
+                        if (isset($cell['t']) && (string) $cell['t'] === 's' && isset($strings[(int) $value])) {
+                            // Shared string
+                            $value = $strings[(int) $value];
+                        }
+                    }
+                    
+                    $cells[$col_index] = $value;
+                }
+                
+                $rows[$row_index] = $cells;
+            }
+            
+            // Write to CSV
+            $csv = fopen($temp_csv, 'w');
+            ksort($rows);  // Sort by row index
+            
+            foreach ($rows as $row) {
+                // Fill in any blank cells
+                $csv_row = array();
+                $max_col = 0;
+                foreach ($row as $col => $value) {
+                    $max_col = max($max_col, $col);
+                }
+                
+                for ($i = 0; $i <= $max_col; $i++) {
+                    $csv_row[$i] = isset($row[$i]) ? $row[$i] : '';
+                }
+                
+                ksort($csv_row);  // Make sure columns are in order
+                fputcsv($csv, $csv_row);
+            }
+            
+            fclose($csv);
+            
+            // Clean up
+            $this->delete_directory($temp_dir);
+            
+            return $temp_csv;
+        } catch (Exception $e) {
+            // Clean up on error
+            if (isset($temp_dir) && is_dir($temp_dir)) {
+                $this->delete_directory($temp_dir);
+            }
+            throw new Exception('Excel conversion error: ' . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Convert column letter to index (A=0, B=1, etc.)
+     */
+    private function column_letter_to_index($column) {
+        $column = strtoupper($column);
+        $index = 0;
+        for ($i = 0; $i < strlen($column); $i++) {
+            $index = $index * 26 + (ord($column[$i]) - ord('A') + 1);
+        }
+        return $index - 1;
+    }
+    
+    /**
+     * Process CSV file to migrate content
+     */
+    private function process_csv_file($file_path, $allow_overwrite) {
+        if (!file_exists($file_path)) {
+            return array(
+                'status' => 'error',
+                'message' => 'File not found: ' . $file_path
+            );
+        }
+        
+        // Increase PHP time and memory limits
+        $this->increase_limits();
+        
+        // Open the CSV file and read rows
+        $handle = fopen($file_path, 'r');
+        if (!$handle) {
+            return array(
+                'status' => 'error',
+                'message' => 'Unable to open file: ' . $file_path
+            );
+        }
+        
+        // Get headers from first row
+        $headers = fgetcsv($handle);
+        if (!$headers || count($headers) < 2) {
+            fclose($handle);
+            return array(
+                'status' => 'error',
+                'message' => 'Invalid CSV format: Missing or invalid headers'
+            );
+        }
+        
+        // Convert header array to associative column indexes
+        $columns = $this->get_column_indexes_from_array($headers);
+        
+        // Check for required columns
+        if (!isset($columns['new_url'])) {
+            fclose($handle);
+            return array(
+                'status' => 'error', 
+                'message' => 'Required column "new_url" is missing in CSV file'
+            );
+        }
+        
+        // Check for MIGRATE column (used to skip rows)
+        $has_migrate_column = isset($columns['migrate']);
+        
+        // Read all rows
+        $rows = array();
+        $row_num = 1; // Start from 1 because headers are row 0
+        
+        while (($row = fgetcsv($handle)) !== false) {
+            $row_num++;
+            
+            // Skip empty rows
+            if (empty($row) || count($row) == 0) {
+                    continue;
+                }
+                
+            // Skip rows with fewer columns than headers
+            if (count($row) < count($headers)) {
+                error_log("MIGRATION WARNING: Row {$row_num} has fewer columns than headers: " . implode(', ', $row));
+                continue;
+            }
+            
+            // If MIGRATE column exists, check if this row should be migrated
+            if ($has_migrate_column) {
+                $migrate_value = trim(isset($row[$columns['migrate']]) ? $row[$columns['migrate']] : '');
+                if (strtoupper($migrate_value) !== 'MIGRATE') {
+                    // Skip this row
+                    continue;
+                }
+            }
+            
+            // Convert CSV row to associative array using column indexes
+                $row_data = array();
+            foreach ($columns as $column_name => $column_index) {
+                if (isset($row[$column_index])) {
+                    $row_data[$column_name] = $row[$column_index];
+                }
+            }
+            
+            // Add to rows array
+            $rows[] = $row_data;
+        }
+        
+        fclose($handle);
+        
+        // Sort rows by hierarchy depth to ensure parents are processed before children
+        $rows = $this->sort_rows_by_hierarchy_depth($rows);
+        
+        // Process each row
+        $results = array(
+            'total' => count($rows),
+            'success' => 0,
+            'skipped' => 0,
+            'error' => 0,
+            'details' => array()
+        );
+        
+        foreach ($rows as $index => $row_data) {
+            // Cache parent IDs for efficiency
+            $row_data = $this->cache_parent_id($row_data, $index, $rows);
+                
+                // Process the row
+            $result = $this->process_row($row_data, $allow_overwrite, true);
+            
+            // Update statistics
+            if ($result['status'] === 'success') {
+                $results['success']++;
+            } elseif ($result['status'] === 'skipped') {
+                $results['skipped']++;
+            } else {
+                $results['error']++;
+            }
+            
+            // Add to details with row information
+            $row_info = array(
+                'row' => $index + 1,
+                'url' => isset($row_data['new_url']) ? $row_data['new_url'] : 'Unknown'
+            );
+            $results['details'][] = array_merge($row_info, $result);
+            
+            // Clear cache periodically
+            if ($index % 10 === 0) {
+                $this->clear_wpdb_query_cache();
+            }
+        }
+        
+        // Final flush of rewrite rules after all posts are created
+        flush_rewrite_rules();
+        
+        return $results;
+    }
+
+    /**
+     * Sort rows by hierarchy depth to ensure parents are processed before children
+     * 
+     * @param array $rows Array of row data
+     * @return array Sorted rows
+     */
+    private function sort_rows_by_hierarchy_depth($rows) {
+        // Function to calculate depth of a URL
+        $get_depth = function($url) {
+            $url = trim($url, '/');
+            // Count slashes to determine depth
+            return substr_count($url, '/') + 1;
+        };
+        
+        // Check for potential duplicates before sorting
+        $seen_urls = array();
+        $seen_slugs = array();
+        
+        foreach ($rows as $index => $row) {
+            $type = isset($row['type']) ? strtolower(trim($row['type'])) : 'page';
+            $new_url = isset($row['new_url']) ? trim($row['new_url'], '/') : '';
+            $slug = $this->extract_slug('/' . $new_url);
+            
+            // Check for duplicate URLs
+            if (!empty($new_url)) {
+                if (isset($seen_urls[$new_url])) {
+                    error_log("MIGRATION WARNING: Duplicate URL detected: '{$new_url}' at rows {$seen_urls[$new_url]} and {$index}");
+                } else {
+                    $seen_urls[$new_url] = $index;
+                }
+            }
+            
+            // For pages, check for duplicate slugs at the same level
+            if ($type === 'page' && !empty($slug)) {
+                $parent_path = '';
+                $parts = explode('/', $new_url);
+                if (count($parts) > 1) {
+                    array_pop($parts); // Remove slug
+                    $parent_path = implode('/', $parts);
+                }
+                
+                $slug_key = $type . '|' . $parent_path . '|' . $slug;
+                
+                if (isset($seen_slugs[$slug_key])) {
+                    error_log("MIGRATION WARNING: Duplicate page slug '{$slug}' with same parent '{$parent_path}' at rows {$seen_slugs[$slug_key]} and {$index}");
+                } else {
+                    $seen_slugs[$slug_key] = $index;
+                }
+            }
+            
+            // For posts, check for exact same title in same category
+            if ($type === 'post' && isset($row['h1']) && !empty($row['h1'])) {
+                $categories = isset($row['categories']) ? trim($row['categories']) : '';
+                $title_key = $type . '|' . $categories . '|' . $row['h1'];
+                
+                if (isset($seen_slugs[$title_key])) {
+                    error_log("MIGRATION WARNING: Duplicate post title '{$row['h1']}' in same categories '{$categories}' at rows {$seen_slugs[$title_key]} and {$index}");
+                } else {
+                    $seen_slugs[$title_key] = $index;
+                }
+            }
+        }
+        
+        // First sort by post type to prioritize pages before posts
+        usort($rows, function($a, $b) use ($get_depth) {
+            // Put pages before posts
+            $type_a = isset($a['type']) ? strtolower(trim($a['type'])) : 'page';
+            $type_b = isset($b['type']) ? strtolower(trim($b['type'])) : 'page';
+            
+            if ($type_a === 'page' && $type_b === 'post') {
+                return -1;
+            }
+            if ($type_a === 'post' && $type_b === 'page') {
+                return 1;
+            }
+            
+            // Same type, sort by URL depth
+            $url_a = isset($a['new_url']) ? $a['new_url'] : '';
+            $url_b = isset($b['new_url']) ? $b['new_url'] : '';
+            
+            $depth_a = $get_depth($url_a);
+            $depth_b = $get_depth($url_b);
+            
+            // Sort by depth (lower depth first)
+            if ($depth_a !== $depth_b) {
+                return $depth_a - $depth_b;
+            }
+            
+            // If same depth, sort by URL alphabetically
+            return strcmp($url_a, $url_b);
+        });
+        
+        // Log the sorted order for debugging
+        error_log("MIGRATION: Sorted " . count($rows) . " rows by hierarchy depth");
+        foreach ($rows as $i => $row) {
+            $type = isset($row['type']) ? $row['type'] : 'unknown';
+            $url = isset($row['new_url']) ? $row['new_url'] : 'unknown';
+            $depth = $get_depth($url);
+            error_log("MIGRATION: Processing order [" . ($i+1) . "] Type: {$type}, Depth: {$depth}, URL: {$url}");
+        }
+        
+        return $rows;
+    }
+    
+    /**
+     * Cache parent IDs for more efficient processing
+     */
+    private function cache_parent_id($row_data, $current_index, $all_rows) {
+        // Skip if no new_url
+        if (empty($row_data['new_url'])) {
+            return $row_data;
+        }
+        
+        // Skip if explicit parent_url is provided
+        if (!empty($row_data['parent_url'])) {
+            return $row_data;
+        }
+        
+        $new_url = '/' . ltrim(trim($row_data['new_url']), '/');
+        $type = isset($row_data['type']) ? strtolower(trim($row_data['type'])) : 'page';
+        
+        // If it's a post or doesn't have a parent, return as is
+        if ($type !== 'page' || strpos(trim($new_url, '/'), '/') === false) {
+            return $row_data;
+        }
+        
+        // Extract parent path
+        $parts = explode('/', trim($new_url, '/'));
+        array_pop($parts); // Remove the last part (current slug)
+        $parent_path = implode('/', $parts);
+        
+        // Look for parent in already processed rows
+        for ($i = 0; $i < $current_index; $i++) {
+            $potential_parent = $all_rows[$i];
+            $potential_parent_url = isset($potential_parent['new_url']) ? 
+                '/' . ltrim(trim($potential_parent['new_url']), '/') : '';
+            
+            if (trim($potential_parent_url, '/') === $parent_path) {
+                // If we found the parent and it has a post ID stored, cache it
+                if (isset($potential_parent['_post_id'])) {
+                    $row_data['_cached_parent_id'] = $potential_parent['_post_id'];
+                    error_log("MIGRATION: Cached parent ID {$potential_parent['_post_id']} for {$new_url} from already processed row");
+                    break;
+                }
+            }
+        }
+        
+        return $row_data;
+    }
+    
+    /**
+     * Clear WordPress database query cache to free up memory
+     */
+    private function clear_wpdb_query_cache() {
+        global $wpdb;
+        
+        if (is_object($wpdb) && isset($wpdb->queries) && is_array($wpdb->queries)) {
+            $wpdb->queries = array();
+        }
+        
+        // Also clear object cache for posts
+        if (function_exists('wp_cache_flush_group')) {
+            wp_cache_flush_group('posts');
+        }
+    }
+
+    /**
+     * Get column indexes from headers
+     */
+    private function get_column_indexes_from_array($headers) {
+        $required_columns = array(
+            'migrate' => array('Migrate', 'MIGRATE', 'migrate'),
+            'menu_name' => array('Menu Name', 'MENU NAME', 'menu name'),
+            'old_url' => array('Old URL', 'OLD URL', 'old url'),
+            'new_url' => array('New URL', 'NEW URL', 'new url'),
+            'meta_title' => array('Meta Title', 'META TITLE', 'meta title'),
+            'h1' => array('H1', 'h1'),
+            'title' => array('Page/Post Title', 'PAGE/POST TITLE', 'page/post title', 'Title', 'TITLE', 'title'),
+            'featured_image' => array('Image', 'IMAGE', 'image', 'Featured Image', 'FEATURED IMAGE', 'featured image'),
+            'process_images' => array('Process Images', 'PROCESS IMAGES', 'process images'),
+            'type' => array('Type', 'TYPE', 'type'),
+            'categories' => array('Categories', 'CATEGORIES', 'categories', 'Category', 'CATEGORY', 'category'),
+            'auto_categories' => array('Auto Categories', 'AUTO CATEGORIES', 'auto categories', 'Auto_Categories', 'auto_categories')
+        );
+        
+        $column_indexes = array();
+        
+        // Log all headers for debugging
+        error_log("MIGRATION: Mapping headers: " . implode(', ', $headers));
+        
+        foreach ($required_columns as $key => $column_names) {
+            $found = false;
+            foreach ($headers as $col_index => $header) {
+                $header = trim($header);
+                // Check for exact match or common alternatives - case insensitive
+                foreach ($column_names as $column_name) {
+                if (strtolower($header) === strtolower($column_name)) {
+                    $column_indexes[$key] = $col_index;
+                    $found = true;
+                        error_log("MIGRATION: Mapped column '$column_name' to index $col_index (header: $header)");
+                        break 2; // Break both loops
+                    }
+                }
+            }
+            
+            if (!$found) {
+                // These columns are optional
+                if ($key === 'featured_image' || $key === 'process_images' || $key === 'categories' || $key === 'auto_categories') {
+                    $column_indexes[$key] = -1; // Set to -1 to indicate not found
+                    error_log("MIGRATION: Optional column not found for key '$key', setting to -1");
+                } else {
+                    $names_str = implode("', '", $column_names);
+                    throw new Exception("Required column not found in Excel file. Looking for one of: '$names_str'");
+                }
+            }
+        }
+        
+        return $column_indexes;
+    }
+
+    /**
+     * Recursively delete a directory
+     */
+    private function delete_directory($dir) {
+        if (!is_dir($dir)) {
+            return;
+        }
+        
+        $objects = scandir($dir);
+        foreach ($objects as $object) {
+            if ($object == "." || $object == "..") continue;
+            
+            $path = $dir . DIRECTORY_SEPARATOR . $object;
+            
+            if (is_dir($path)) {
+                $this->delete_directory($path);
+            } else {
+                unlink($path);
+            }
+        }
+        
+        rmdir($dir);
+    }
+
+    /**
+     * Process a single row of data
+     * 
+     * @param array $row_data Row data in key => value format
+     * @param bool $allow_overwrite Whether to overwrite existing content
+     * @param bool $skip_rewrite_flush Whether to skip flushing rewrite rules
+     * @return array Results of the operation
+     */
+    private function process_row($row_data, $allow_overwrite, $skip_rewrite_flush = false) {
+        // Extract row data
+        $old_url = isset($row_data['old_url']) ? trim($row_data['old_url']) : '';
+        $new_url = isset($row_data['new_url']) ? trim($row_data['new_url']) : '';
+        $meta_title = isset($row_data['meta_title']) ? trim($row_data['meta_title']) : '';
+        $page_title = isset($row_data['title']) ? trim($row_data['title']) : '';
+        $h1 = isset($row_data['h1']) ? trim($row_data['h1']) : '';
+        $featured_image = isset($row_data['featured_image']) ? trim($row_data['featured_image']) : '';
+        $type = isset($row_data['type']) ? strtolower(trim($row_data['type'])) : 'page';
+        $process_images = isset($row_data['process_images']) ? strtolower(trim($row_data['process_images'])) : 'yes';
+        $parent_url = isset($row_data['parent_url']) ? trim($row_data['parent_url']) : '';
+        $categories = isset($row_data['categories']) && $row_data['categories'] !== -1 ? trim($row_data['categories']) : '';
+        $auto_categories = isset($row_data['auto_categories']) && $row_data['auto_categories'] !== -1 ? strtolower(trim($row_data['auto_categories'])) : 'no';
+        
+        // Ensure type is valid
+        if ($type !== 'post' && $type !== 'page') {
+            $type = 'page'; // Default to page
+        }
+        
+        // Ensure we have required data
+        if (empty($new_url)) {
+            return array(
+                'status' => 'error',
+                'message' => 'Missing required field: New URL'
+            );
+        }
+        
+        // Normalize new_url - ensure it starts with a slash and doesn't end with one
+        $new_url = '/' . ltrim(trim($new_url), '/');
+        $new_url = rtrim($new_url, '/');
+        
+        // Generate slug from new URL
+        $slug = $this->extract_slug($new_url);
+        
+        // Build the full path for finding existing posts and establishing parent-child relationships
+        $full_path = ltrim($new_url, '/');
+        
+        // Improved check for existing post with the exact same path - handling parent-child correctly
+        $existing_post = $this->find_existing_post_by_path($full_path, $type);
+        
+        // If not found by path, try to find by slug and check if it has the right parent
+        if (!$existing_post && $type === 'page') {
+            global $wpdb;
+            $potential_pages = $wpdb->get_results($wpdb->prepare(
+                "SELECT ID, post_parent FROM $wpdb->posts WHERE post_name = %s AND post_type = 'page' AND post_status IN ('publish', 'draft')",
+                $slug
+            ));
+            
+            if (!empty($potential_pages)) {
+                // Get the parent ID we would assign
+                $expected_parent_id = 0;
+                if (!empty($parent_url)) {
+                    // Find parent by explicit parent_url
+                    $parent_path = ltrim(trim($parent_url), '/');
+                    $parent_post = get_page_by_path($parent_path, OBJECT, $type);
+                    if ($parent_post) {
+                        $expected_parent_id = $parent_post->ID;
+                    }
+                } else {
+                    // Determine parent from URL structure
+                    $expected_parent_id = $this->determine_parent_by_path($full_path, $type);
+                }
+                
+                // Check if any of the existing pages with this slug has the correct parent
+                foreach ($potential_pages as $page) {
+                    if ((int)$page->post_parent === (int)$expected_parent_id) {
+                        $existing_post = get_post($page->ID);
+                        error_log("MIGRATION: Found existing page with matching slug and parent: {$slug} (ID: {$page->ID}, Parent: {$page->post_parent})");
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if ($existing_post && !$allow_overwrite) {
+            return array(
+                'status' => 'skipped',
+                'message' => "Content already exists at {$new_url} (ID: {$existing_post->ID}). Skipped."
+            );
+        }
+        
+        // Scrape content from old URL only if needed
+        $content = '';
+        if ((!$existing_post || $allow_overwrite) && !empty($old_url) && filter_var($old_url, FILTER_VALIDATE_URL)) {
+            error_log("Scraping content from: {$old_url}");
+            $scraped_data = $this->scrape_content($old_url);
+            
+            if (!empty($scraped_data['content'])) {
+                $content = $scraped_data['content'];
+                
+                // Use scraped title and H1 if not explicitly provided
+                if (empty($page_title) && !empty($scraped_data['title'])) {
+                    $page_title = $scraped_data['title'];
+                }
+                
+                if (empty($h1) && !empty($scraped_data['h1'])) {
+                    $h1 = $scraped_data['h1'];
+                }
+            }
+        }
+        
+        // If we still don't have title or H1, use slug as fallback
+        if (empty($page_title)) {
+            $page_title = ucwords(str_replace('-', ' ', $slug));
+        }
+        
+        if (empty($h1)) {
+            $h1 = $page_title;
+        }
+        
+        // If meta title is still empty, use page title
+        if (empty($meta_title)) {
+            $meta_title = $page_title;
+        }
+        
+        // Get or determine parent for hierarchical URLs
+        // First check if explicit parent_url is provided in CSV
+        $post_parent = 0;
+        if (!empty($parent_url)) {
+            // Normalize parent_url to ensure it starts with a slash
+            $parent_url = '/' . ltrim(trim($parent_url), '/');
+            $parent_path = ltrim($parent_url, '/');
+            
+            // Find parent post by its URL path
+            $parent_post = get_page_by_path($parent_path, OBJECT, $type);
+            if ($parent_post) {
+                $post_parent = $parent_post->ID;
+                error_log("MIGRATION: Found parent by explicit parent_url '{$parent_url}': ID {$post_parent}");
+            } else {
+                error_log("MIGRATION WARNING: Specified parent_url '{$parent_url}' not found, trying URL-based parent determination");
+                
+                // For multi-level hierarchy, we need to ensure parent exists
+                // Check if we're dealing with a multi-level path
+                $parent_parts = explode('/', $parent_path);
+                if (count($parent_parts) > 1) {
+                    error_log("MIGRATION: Processing multi-level parent path: {$parent_path}");
+                    
+                    // Build each level of the parent path
+                    $accumulated_path = '';
+                    $current_parent_id = 0;
+                    
+                    foreach ($parent_parts as $i => $part) {
+                        if (empty($part)) continue;
+                        
+                        // Add this segment to our accumulated path
+                        if (!empty($accumulated_path)) {
+                            $accumulated_path .= '/';
+                        }
+                        $accumulated_path .= $part;
+                        
+                        // Check if this level exists
+                        $level_post = get_page_by_path($accumulated_path, OBJECT, $type);
+                        
+                        if ($level_post) {
+                            // This level exists, use its ID as parent for next level
+                            $current_parent_id = $level_post->ID;
+                            error_log("MIGRATION: Found existing parent level at '{$accumulated_path}': ID {$current_parent_id}");
+                        } else {
+                            // This level doesn't exist yet - might want to create it
+                            error_log("MIGRATION WARNING: Parent level '{$accumulated_path}' doesn't exist in hierarchy");
+                            break;
+                        }
+                    }
+                    
+                    // If we found a valid parent ID from the hierarchy, use it
+                    if ($current_parent_id > 0) {
+                        $post_parent = $current_parent_id;
+                    }
+                }
+            }
+        }
+        
+        // If no explicit parent or parent not found, use the URL structure
+        if ($post_parent == 0) {
+            if (isset($row_data['_cached_parent_id'])) {
+                $post_parent = $row_data['_cached_parent_id'];
+            } else {
+                $post_parent = $this->determine_parent_by_path($full_path, $type);
+            }
+        }
+        
+        // Debug parent relationship
+        error_log("MIGRATION: URL '{$new_url}' with slug '{$slug}' has parent ID: {$post_parent}");
+            
+            // Prepare post data
+            $post_data = array(
+            'post_title' => $page_title,
+                'post_name' => $slug,
+            'post_content' => $this->prepare_post_content($content, $h1, $meta_title),
+                'post_status' => 'publish',
+            'post_type' => $type,
+            'post_parent' => $post_parent,
+            );
+            
+        // If we're updating an existing post
+            if ($existing_post) {
+                $post_data['ID'] = $existing_post->ID;
+                $post_id = wp_update_post($post_data);
+                $action = 'updated';
+            } else {
+                $post_id = wp_insert_post($post_data);
+                $action = 'created';
+            }
+            
+            if (is_wp_error($post_id)) {
+                return array(
+                    'status' => 'error',
+                'message' => "Failed to {$action} {$type}: " . $post_id->get_error_message()
+            );
+        }
+        
+        // Store original URLs and other metadata
+        update_post_meta($post_id, '_content_migrator_old_url', $old_url);
+        update_post_meta($post_id, '_content_migrator_new_url', $new_url);
+        update_post_meta($post_id, '_yoast_wpseo_title', $meta_title);
+        
+        // Quick processing for internal links
+        $updated_content = $post_data['post_content'];
+        if (!empty($old_url)) {
+            $updated_content = str_replace($old_url, $new_url, $updated_content);
+        }
+        
+        // Process images if requested
+        if ($process_images === 'yes' && !empty($updated_content) && !empty($old_url)) {
+            $content_with_images = $this->process_content_images($updated_content, $post_id, $old_url);
+            
+            if ($content_with_images !== $updated_content) {
+                $updated_content = $content_with_images;
+            }
+        }
+        
+        // Set featured image if specified
+        if (!empty($featured_image)) {
+            if (strtolower($featured_image) === 'yes' || strtolower($featured_image) === 'auto') {
+                $extract_result = $this->extract_first_image_as_featured($updated_content, $post_id);
+                if (!empty($extract_result['content']) && $extract_result['content'] !== $updated_content) {
+                    $updated_content = $extract_result['content'];
+                }
+            } else if (filter_var($featured_image, FILTER_VALIDATE_URL)) {
+                $this->set_featured_image($post_id, $featured_image);
+            }
+        }
+        
+        // Update the post with all content changes
+        if ($updated_content !== $post_data['post_content']) {
+            wp_update_post(array(
+                'ID' => $post_id,
+                'post_content' => $updated_content
+            ));
+        }
+        
+        // Add categories for posts - ONLY use explicit categories from CSV
+        if ($type === 'post') {
+            $category_ids = array();
+            
+            // Debug all post data to see what's coming in
+            error_log("MIGRATION DEBUG: Full row_data for post ID {$post_id}:");
+            error_log(print_r($row_data, true));
+            // Log category variable type and value
+            error_log("MIGRATION DEBUG: Categories variable: " . gettype($categories) . ", Value: '" . $categories . "'");
+            // If explicit categories are provided in CSV
+            if (!empty($categories)) {
+                error_log("MIGRATION DEBUG: Processing category: '{$categories}' for post ID: {$post_id}");
+                
+                // No longer splitting by comma - just use the exact category name as provided
+                $cat_name = trim($categories);
+                if (!empty($cat_name)) {
+                    error_log("MIGRATION DEBUG: Processing category: '{$cat_name}'");
+                    
+                    // Try to get existing category
+                    $existing_category = get_term_by('name', $cat_name, 'category');
+                    if ($existing_category && !is_wp_error($existing_category)) {
+                        $cat_id = $existing_category->term_id;
+                        error_log("MIGRATION DEBUG: Found existing category by exact name: '{$cat_name}' (ID: {$cat_id})");
+                    } else {
+                        // Try by slug
+                        $slug = sanitize_title($cat_name);
+                        $existing_category = get_term_by('slug', $slug, 'category');
+                        if ($existing_category && !is_wp_error($existing_category)) {
+                            $cat_id = $existing_category->term_id;
+                            error_log("MIGRATION DEBUG: Found existing category by slug: '{$slug}' (ID: {$cat_id})");
+                        } else {
+                            // Create new category
+                            error_log("MIGRATION DEBUG: Creating new category: '{$cat_name}' with slug: '{$slug}'");
+                            $result = wp_insert_term($cat_name, 'category');
+                            if (!is_wp_error($result)) {
+                                $cat_id = $result['term_id'];
+                                error_log("MIGRATION: Created new category: '{$cat_name}' (ID: {$cat_id})");
+                            } else {
+                                error_log("MIGRATION ERROR: Failed to create category '{$cat_name}': " . $result->get_error_message());
+                                $cat_id = 0;
+                            }
+                        }
+                    }
+                    if ($cat_id) {
+                        $category_ids[] = $cat_id;
+                        error_log("MIGRATION: Added category ID {$cat_id} to list for post ID: {$post_id}");
+                    }
+                }
+            } else {
+                error_log("MIGRATION DEBUG: No explicit category provided in CSV, categories variable is empty");
+                
+                // Check if the Categories column exists but is empty
+                error_log("MIGRATION DEBUG: Checking if 'categories' key exists in row_data: " . (isset($row_data['categories']) ? 'yes' : 'no'));
+                
+                // Use the auto_categories value we already extracted
+                error_log("MIGRATION DEBUG: auto_categories setting: {$auto_categories}");
+                
+                if ($auto_categories === 'yes') {
+                    // Determine from URL structure only if auto_categories is enabled
+                    $category_ids = $this->determine_post_categories_improved($new_url);
+                    error_log("MIGRATION: Determined categories from URL structure: " . implode(', ', $category_ids) . " for post ID: {$post_id}");
+                } else {
+                    // Use default category
+                    $default_category = get_option('default_category');
+                    if ($default_category) {
+                        $category_ids[] = $default_category;
+                        error_log("MIGRATION: Using default WordPress category for post ID: {$post_id}");
+                    }
+                }
+            }
+            
+            // Set the categories
+            if (!empty($category_ids)) {
+                error_log("MIGRATION: Setting " . count($category_ids) . " categories for post ID: {$post_id}: " . implode(', ', $category_ids));
+                
+                // Check if post exists before setting categories
+                $post_exists = get_post($post_id);
+                if ($post_exists) {
+                    // IMPORTANT: REPLACE categories rather than append
+                    $result = wp_set_post_categories($post_id, $category_ids, false);
+                    error_log("MIGRATION DEBUG: wp_set_post_categories result: " . var_export($result, true));
+                    
+                    // Verify the categories were actually set
+                    $assigned_cats = wp_get_post_categories($post_id);
+                    error_log("MIGRATION DEBUG: Categories after assignment: " . implode(', ', $assigned_cats));
+                    
+                    // Check if categories match what we expected
+                    $missing_cats = array_diff($category_ids, $assigned_cats);
+                    if (!empty($missing_cats)) {
+                        error_log("MIGRATION WARNING: Some categories were not assigned: " . implode(', ', $missing_cats));
+                    }
+                } else {
+                    error_log("MIGRATION ERROR: Post ID {$post_id} does not exist, cannot set categories");
+                }
+            } else {
+                error_log("MIGRATION WARNING: No valid categories found for post ID: {$post_id}");
+            }
+        }
+        
+        // Flush rewrite rules if needed
+        if (!$skip_rewrite_flush) {
+            flush_rewrite_rules();
+        }
+            
+            return array(
+                'status' => 'success',
+            'message' => ucfirst($type) . " {$action} successfully at {$new_url}",
+            'post_id' => $post_id
+        );
+    }
+
+    /**
+     * Find an existing post by its exact path
+     */
+    private function find_existing_post_by_path($path, $post_type) {
+        // Direct lookup for exact path match
+        $post = get_page_by_path($path, OBJECT, $post_type);
+        if ($post) {
+            error_log("MIGRATION: Found existing post by exact path: {$path} (ID: {$post->ID})");
+            return $post;
+        }
+        
+        // If not found and this is a page, we need to check more carefully for hierarchy
+        if ($post_type === 'page') {
+            // Get the last segment as the slug
+            $parts = explode('/', $path);
+            $slug = end($parts);
+            
+            // Find all pages with this slug
+            global $wpdb;
+            $potential_posts = $wpdb->get_results($wpdb->prepare(
+                "SELECT ID, post_title, post_parent FROM $wpdb->posts WHERE post_name = %s AND post_type = 'page' AND post_status IN ('publish', 'draft')",
+                $slug
+            ));
+            
+            if ($potential_posts) {
+                // For a more thorough check, we need to verify the full path matches
+                foreach ($potential_posts as $potential_post) {
+                    // Get the full hierarchical path for this post
+                    $post_path = $this->get_post_path($potential_post->ID);
+                    
+                    if ($post_path === $path) {
+                        error_log("MIGRATION: Found existing page by matching full path hierarchy: {$path} (ID: {$potential_post->ID})");
+                        return get_post($potential_post->ID);
+                    }
+                }
+                
+                // If we get here, no exact path match was found, but we might have found posts with similar slugs
+                error_log("MIGRATION: Found pages with slug '{$slug}', but none matched the full path '{$path}'");
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Determine parent based on exact path
+     */
+    private function determine_parent_by_path($path, $post_type) {
+        if (empty($path) || $post_type !== 'page') {
+            return 0;
+        }
+        
+        // Find the parent path by removing the last segment
+        $path_parts = explode('/', $path);
+        
+        // If there's only one part, there's no parent
+        if (count($path_parts) <= 1) {
+            return 0;
+        }
+        
+        // Remove the last part (current slug)
+        array_pop($path_parts);
+        $parent_path = implode('/', $path_parts);
+        
+        // Find the parent by path
+        $parent = get_page_by_path($parent_path, OBJECT, $post_type);
+        
+        // Debug parent lookup
+        if ($parent) {
+            error_log("MIGRATION: Found parent for '{$path}': {$parent->ID} at path '{$parent_path}'");
+        } else {
+            error_log("MIGRATION: No parent found for '{$path}' at path '{$parent_path}'");
+        }
+        
+        return $parent ? $parent->ID : 0;
+    }
+
+    /**
+     * Improved category determination for posts
+     */
+    private function determine_post_categories_improved($url) {
+        $url = trim($url, '/');
+        $parts = explode('/', $url);
+        $category_ids = array();
+        
+        // Only continue if we have parts to process
+        if (count($parts) > 0) {
+            // The first segment is usually the primary category for blog posts
+            $primary_cat_slug = $parts[0];
+            
+            // Default to 'blog' if not found or empty
+            if (empty($primary_cat_slug)) {
+                $primary_cat_slug = 'blog';
+            }
+            
+            $category_id = $this->get_or_create_category($primary_cat_slug);
+            if ($category_id) {
+                $category_ids[] = $category_id;
+                error_log("MIGRATION: Assigned post to category from URL: {$primary_cat_slug} (ID: {$category_id})");
+            }
+            
+            // For deeper URLs, also add the second segment as a subcategory if applicable
+            if (count($parts) > 1) {
+                $subcategory_slug = $parts[1];
+                $subcategory_id = $this->get_or_create_category($subcategory_slug, $category_id);
+                if ($subcategory_id && $subcategory_id != $category_id) {
+                    $category_ids[] = $subcategory_id;
+                    error_log("MIGRATION: Also assigned to subcategory from URL: {$subcategory_slug} (ID: {$subcategory_id})");
+                }
+            }
+        } else {
+            // If no path segments, assign to default 'blog' category
+            $category_id = $this->get_or_create_category('blog');
+            if ($category_id) {
+                $category_ids[] = $category_id;
+                error_log("MIGRATION: Assigned post to default 'blog' category (ID: {$category_id})");
+            }
+        }
+        
+        return $category_ids;
+    }
+
+    /**
+     * Get or create a category by slug, optionally as a child of another category
+     */
+    private function get_or_create_category($slug, $parent_id = 0, $name = '') {
+        // First, try to find existing category
+        $category = get_category_by_slug($slug);
+        
+        if ($category) {
+            return $category->term_id;
+        } else {
+            // Create the category if it doesn't exist
+            // Use provided name or convert slug to a proper name (capitalize words)
+            if (empty($name)) {
+                $name = ucwords(str_replace(array('-', '_'), ' ', $slug));
+            }
+            
+            // Add parent category if specified
+            $args = array();
+            if ($parent_id > 0) {
+                $args['parent'] = $parent_id;
+            }
+            
+            $result = wp_insert_term($name, 'category', $args);
+            
+            if (is_wp_error($result)) {
+                error_log("MIGRATION ERROR: Failed to create category '{$name}': " . $result->get_error_message());
+                return 0;
+            }
+            
+            return $result['term_id'];
+        }
+    }
+
+    /**
+     * Find existing post by slug or path
+     */
+    private function find_existing_post($slug, $post_type, $full_path = '') {
+        global $wpdb;
+        
+        // For hierarchical paths, we need to check the entire path
+        // This is especially important for pages
+        if (!empty($full_path) && $post_type === 'page') {
+            // Remove leading and trailing slashes for consistency
+            $full_path = trim($full_path, '/');
+            
+            // First try to find by exact path using get_page_by_path
+            $post = get_page_by_path($full_path, OBJECT, $post_type);
+            if ($post) {
+                error_log("MIGRATION: Found existing post by full path: {$full_path} (ID: {$post->ID})");
+                return $post;
+            }
+            
+            // If not found, try with just the slug but verify the path
+            $posts = get_posts(array(
+                'name' => $slug,
+                'post_type' => $post_type,
+                'posts_per_page' => -1 // Get all matching posts
+            ));
+            
+            if (!empty($posts)) {
+                foreach ($posts as $post) {
+                    // Check if this post is at the correct hierarchical location
+                    $post_path = $this->get_post_path($post->ID);
+                    if ($post_path === $full_path) {
+                        error_log("MIGRATION: Found existing post by matching path: {$full_path} (ID: {$post->ID})");
+                        return $post;
+                    }
+                }
+            }
+            
+            // Not found with correct hierarchy
+            return null;
+        }
+        
+        // For non-hierarchical post types or simple slugs
+        $post_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT ID FROM $wpdb->posts WHERE post_name = %s AND post_type = %s LIMIT 1",
+            $slug,
+            $post_type
+        ));
+        
+        if ($post_id) {
+            return get_post($post_id);
+        }
+        
+        return null;
+    }
+
+    /**
+     * Get the full hierarchical path of a post
+     */
+    private function get_post_path($post_id) {
+        $post = get_post($post_id);
+        if (!$post) {
+            return '';
+        }
+        
+        $path = $post->post_name;
+        
+        // If it has a parent, recursively build the path
+        if ($post->post_parent) {
+            $parent_path = $this->get_post_path($post->post_parent);
+            if (!empty($parent_path)) {
+                $path = $parent_path . '/' . $path;
+            }
+        }
+        
+        return $path;
+    }
+    
+    /**
+     * Scrapes content from a URL.
+     *
+     * @param string $url The URL to scrape.
+     * @return array An array containing the scraped content, meta description, and status.
+     */
+    private function scrape_content($url) {
+        $result = array(
+            'content' => '',
+            'meta_description' => '',
+            'status' => 'error',
+            'extraction_method' => 'none',
+            'html' => '',
+            'page_title' => ''
+        );
+        
+        if (empty($url)) {
+            $result['content'] = 'Error: Empty URL provided';
+            return $result;
+        }
+        
+        // Use wp_remote_get with extended timeout and browser-like user agent
+        $response = wp_remote_get($url, array(
+            'timeout' => 90,
+            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36',
+            'sslverify' => false,
+            'headers' => array(
+                'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language' => 'en-US,en;q=0.5',
+            )
+        ));
+        
+        // Check for HTTP error
+        if (is_wp_error($response)) {
+            $result['content'] = 'Error fetching URL: ' . $response->get_error_message();
+            error_log("MIGRATION ERROR: Failed to fetch URL: {$url} - " . $response->get_error_message());
+            return $result;
+        }
+        
+        // Get response code
+        $response_code = wp_remote_retrieve_response_code($response);
+        if ($response_code !== 200) {
+            $result['content'] = 'Error: Received HTTP response code ' . $response_code;
+            error_log("MIGRATION ERROR: HTTP error {$response_code} for URL: {$url}");
+            return $result;
+        }
+        
+        // Get HTML content
+        $html = wp_remote_retrieve_body($response);
+        if (empty($html)) {
+            $result['content'] = 'Error: Empty response from URL';
+            error_log("MIGRATION ERROR: Empty response for URL: {$url}");
+            return $result;
+        }
+        
+        // Store the HTML for later use
+        $result['html'] = $html;
+        
+        // Extract page title
+        $page_title = $this->extract_page_title($html);
+        $result['page_title'] = $page_title;
+        error_log("MIGRATION: Extracted page title: " . substr($page_title, 0, 50));
+        
+        // Extract meta description
+        $meta_description = '';
+        if (preg_match('/<meta[^>]*name=["|\']description["|\'][^>]*content=["|\']([^"\']+)["|\'][^>]*>/i', $html, $matches)) {
+            $meta_description = $matches[1];
+        } elseif (preg_match('/<meta[^>]*property=["|\']og:description["|\'][^>]*content=["|\']([^"\']+)["|\'][^>]*>/i', $html, $matches)) {
+            $meta_description = $matches[1];
+        }
+        $result['meta_description'] = $meta_description;
+        
+        // Filter out navigation, footer, headers, etc. before extraction
+        $filtered_html = $this->filter_menus($html);
+        
+        // Try multiple strategies to extract the main content
+        $content = '';
+        
+        // Strategy 1: Advanced extraction - most sophisticated method
+        $content = $this->extract_content_advanced($filtered_html, $url);
+        
+        if (!empty($content)) {
+            $result['extraction_method'] = 'advanced';
+            error_log("MIGRATION: Successfully extracted content using advanced method - size: " . strlen($content));
+        }
+        
+        // Strategy 2: Try extracting the main container directly
+        if (empty($content) || strlen(strip_tags($content)) < 200) {
+            $main_content = $this->extract_full_content($filtered_html);
+            if (!empty($main_content) && strlen(strip_tags($main_content)) > strlen(strip_tags($content))) {
+                $content = $main_content;
+                $result['extraction_method'] = 'main_container';
+                error_log("MIGRATION: Using main container extraction - size: " . strlen($content));
+            }
+        }
+        
+        // Strategy 3: If still no content, extract the largest paragraph group
+        if (empty($content) || strlen(strip_tags($content)) < 200) {
+            $para_content = $this->find_largest_paragraph_group($filtered_html);
+            if (!empty($para_content)) {
+                $content = $para_content;
+                $result['extraction_method'] = 'paragraph_group';
+                error_log("MIGRATION: Using largest paragraph group - size: " . strlen($content));
+            }
+        }
+        
+        // Strategy 4: Fallback to basic paragraph extraction from whole document
+        if (empty($content) || strlen(strip_tags($content)) < 200) {
+            preg_match_all('/<p[^>]*>(.*?)<\/p>/is', $html, $paragraph_matches);
+            if (!empty($paragraph_matches[0])) {
+                $content = '<div>' . implode("", $paragraph_matches[0]) . '</div>';
+                $result['extraction_method'] = 'basic_paragraphs';
+                error_log("MIGRATION: Using basic paragraph extraction - size: " . strlen($content));
+            }
+        }
+        
+        // Final fallback: If still no content, try to extract any text content
+        if (empty($content) || strlen(strip_tags($content)) < 100) {
+            $body_content = '';
+            if (preg_match('/<body[^>]*>(.*)<\/body>/is', $html, $body_matches)) {
+                $body_content = $body_matches[1];
+            }
+            
+            if (!empty($body_content)) {
+                // Strip scripts, styles, and other non-content elements
+                $body_content = preg_replace('/<script\b[^>]*>(.*?)<\/script>/is', '', $body_content);
+                $body_content = preg_replace('/<style\b[^>]*>(.*?)<\/style>/is', '', $body_content);
+                $body_content = preg_replace('/<nav\b[^>]*>.*?<\/nav>/is', '', $body_content);
+                $body_content = preg_replace('/<header\b[^>]*>.*?<\/header>/is', '', $body_content);
+                $body_content = preg_replace('/<footer\b[^>]*>.*?<\/footer>/is', '', $body_content);
+                
+                // Extract anything that might be content
+                $content = $body_content;
+                $result['extraction_method'] = 'body_fallback';
+                error_log("MIGRATION: Using body fallback extraction - size: " . strlen($content));
+            }
+        }
+        
+        // Clean the HTML content before returning
+        if (!empty($content)) {
+            $content = $this->clean_html_content($content);
+            $result['content'] = $content;
+            $result['status'] = 'success';
+            error_log("MIGRATION: Content extraction success - final size: " . strlen($content));
+        } else {
+            error_log("MIGRATION ERROR: Failed to extract content from URL: {$url}");
+        }
+        
+        return $result;
+    }
+    
+    /**
+     * Filter out navigation/menu sections from HTML before content extraction
+     */
+    private function filter_menus($html) {
+        // Create backup of original HTML
+        $original_html = $html;
+        $filtered = $html;
+        
+        // First pass: Remove all obvious menus, navigation, and non-content sections
+        // Remove all menu/navigation elements
+        $filtered = preg_replace('/<nav\b[^>]*>.*?<\/nav>/is', '', $filtered);
+        
+        // Remove header elements
+        $filtered = preg_replace('/<header\b[^>]*>.*?<\/header>/is', '', $filtered);
+        
+        // Remove footer elements
+        $filtered = preg_replace('/<footer\b[^>]*>.*?<\/footer>/is', '', $filtered);
+        
+        // Remove comment section
+        $filtered = preg_replace('/<div\b[^>]*id=["|\']comments["|\'][^>]*>.*?<\/div>/is', '', $filtered);
+        $filtered = preg_replace('/<section\b[^>]*id=["|\']comments["|\'][^>]*>.*?<\/section>/is', '', $filtered);
+        
+        // Remove any elements with these specific class patterns
+        $class_patterns = array(
+            'menu', 'navigation', 'navbar', 'nav-', 'sidebar', 'widget', 
+            'footer', 'header', 'comment', 'social', 'share', 'author-bio',
+            'related', 'promotion', 'advertisement', 'banner', 'signup',
+            'newsletter', 'subscribe', 'popup', 'modal', 'cookie'
+        );
+        
+        foreach ($class_patterns as $pattern) {
+            $filtered = preg_replace('/<[^>]*class=["\'][^"\']*' . $pattern . '[^"\']*["\'](.*?)>.*?<\/[^>]*>/is', '', $filtered);
+        }
+        
+        // Remove specific types of elements that typically aren't content
+        $element_patterns = array(
+            '/<script\b[^>]*>(.*?)<\/script>/is',
+            '/<style\b[^>]*>(.*?)<\/style>/is',
+            '/<noscript\b[^>]*>(.*?)<\/noscript>/is',
+            '/<form\b[^>]*>.*?<\/form>/is',
+            '/<select\b[^>]*>.*?<\/select>/is',
+            '/<button\b[^>]*>.*?<\/button>/is',
+            '/<aside\b[^>]*>.*?<\/aside>/is',
+            '/<meta\b[^>]*>/is',
+            '/<link\b[^>]*>/is',
+            '/<!--(.*?)-->/s',  // HTML comments
+        );
+        
+        foreach ($element_patterns as $pattern) {
+            $filtered = preg_replace($pattern, '', $filtered);
+        }
+        
+        // If we've filtered out too much, revert to the original HTML
+        if (strlen($filtered) < (strlen($original_html) * 0.3)) {
+            error_log("MIGRATION WARNING: Too much content filtered out. Reverting to original HTML.");
+            $filtered = $original_html;
+            
+            // Do minimal filtering to ensure we don't lose content
+            $filtered = preg_replace('/<script\b[^>]*>(.*?)<\/script>/is', '', $filtered);
+            $filtered = preg_replace('/<style\b[^>]*>(.*?)<\/style>/is', '', $filtered);
+            $filtered = preg_replace('/<!--(.*?)-->/s', '', $filtered);
+        }
+        
+        return $filtered;
+    }
+    
+    /**
+     * Extract full content by getting entire sections or complete body
+     */
+    private function extract_full_content($html) {
+        // Try to get the entire article or main content section first
+        $content_containers = array(
+            // Try article element first (highest priority)
+            '/<article[^>]*>(.*?)<\/article>/is',
+            
+            // Main content containers
+            '/<main[^>]*>(.*?)<\/main>/is',
+            '/<div[^>]*class="[^"]*content-area[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<div[^>]*class="[^"]*main-content[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<div[^>]*class="[^"]*page-content[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<div[^>]*class="[^"]*entry-content[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<div[^>]*class="[^"]*post-content[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<div[^>]*class="[^"]*article-content[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<div[^>]*class="[^"]*single-content[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<div[^>]*class="[^"]*content[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<section[^>]*class="[^"]*content[^"]*"[^>]*>(.*?)<\/section>/is',
+            
+            // Last resort body tag
+            '/<body[^>]*>(.*)<\/body>/is',
+        );
+        
+        $largest_content = '';
+        $largest_text_length = 0;
+        
+        foreach ($content_containers as $pattern) {
+            if (preg_match_all($pattern, $html, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $match) {
+                    $content_part = isset($match[1]) ? $match[1] : '';
+                    
+                    // Skip if this looks like a menu/navigation
+                    if (strpos(strtolower($content_part), 'menu') !== false && 
+                        (strpos(strtolower($content_part), '<ul') !== false || 
+                         strpos(strtolower($content_part), '<li') !== false)) {
+                        continue;
+                    }
+                    
+                    // Clean it to get a better size comparison
+                    $text_content = strip_tags($content_part);
+                    $text_length = strlen($text_content);
+                    
+                    // Look for actual paragraphs, not just lists
+                    $has_paragraphs = strpos($content_part, '<p') !== false;
+                    
+                    // Choose the largest content that has paragraphs
+                    if ($text_length > $largest_text_length && $has_paragraphs && $text_length > 100) {
+                        $largest_content = $content_part;
+                        $largest_text_length = $text_length;
+                    }
+                }
+            }
+        }
+        
+        if (!empty($largest_content)) {
+            return $largest_content;
+        }
+        
+        return '';
+    }
+    
+    /**
+     * Advanced content extraction using multiple strategies
+     */
+    private function extract_content_advanced($html, $url) {
+        // First pass - try to match common content containers by ID and class
+        $content_patterns = array(
+            // Main content containers
+            '/<main(?:\s+[^>]*)?>(.*?)<\/main>/is',
+            '/<article(?:\s+[^>]*)?>(.*?)<\/article>/is',
+            '/<div(?:\s+[^>]*)?\s+id=["\']content["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+id=["\']main-content["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+id=["\']primary["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+id=["\']post-content["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+id=["\']page-content["\'](.*?)>(.*?)<\/div>/is',
+            
+            // Common class names for content
+            '/<div(?:\s+[^>]*)?\s+class=["\'][^"\']*?page-content[^"\']*?["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+class=["\'][^"\']*?entry-content[^"\']*?["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+class=["\'][^"\']*?post-content[^"\']*?["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+class=["\'][^"\']*?article-content[^"\']*?["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+class=["\'][^"\']*?main-content[^"\']*?["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+class=["\'][^"\']*?content-area[^"\']*?["\'](.*?)>(.*?)<\/div>/is',
+            '/<div(?:\s+[^>]*)?\s+class=["\'][^"\']*?content[^"\']*?["\'](.*?)>(.*?)<\/div>/is',
+            
+            // Section elements with content classes
+            '/<section(?:\s+[^>]*)?\s+class=["\'][^"\']*?content[^"\']*?["\'](.*?)>(.*?)<\/section>/is',
+            '/<section(?:\s+[^>]*)?\s+id=["\']content["\'](.*?)>(.*?)<\/section>/is',
+        );
+        
+        // First try to match with patterns (taking the largest match)
+        $best_match = '';
+        $best_match_size = 0;
+        
+        foreach ($content_patterns as $pattern) {
+            if (preg_match_all($pattern, $html, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $match) {
+                    $content_part = isset($match[2]) ? $match[2] : $match[1];
+                    
+                    // Clean it to get a better size comparison
+                    $cleaned = strip_tags($content_part);
+                    $text_length = strlen($cleaned);
+                    
+                    // Skip obviously small content or ones without paragraphs
+                    if ($text_length < 200 || strpos($content_part, '<p') === false) {
+                        continue;
+                    }
+                    
+                    if ($text_length > $best_match_size) {
+                        $best_match = $content_part;
+                        $best_match_size = $text_length;
+                    }
+                }
+            }
+        }
+        
+        if (!empty($best_match) && $best_match_size > 500) {
+            return $best_match;
+        }
+        
+        // Second strategy: Try finding the page title and then get content after it
+        $page_title = $this->extract_page_title($html);
+        if (!empty($page_title)) {
+            // Try to find the title in the content, and get everything after it
+            $title_pattern = preg_quote($page_title, '/');
+            
+            // Look for the title in an H1 tag
+            if (preg_match('/<h1[^>]*>' . $title_pattern . '<\/h1>(.*)/is', $html, $matches)) {
+                $content_after_title = $matches[1];
+                if (strlen(strip_tags($content_after_title)) > 500) {
+                    return $content_after_title;
+                }
+            }
+            
+            // Look for the title as a strong element or paragraph
+            if (preg_match('/<(?:strong|p)[^>]*>' . $title_pattern . '<\/(?:strong|p)>(.*)/is', $html, $matches)) {
+                $content_after_title = $matches[1];
+                if (strlen(strip_tags($content_after_title)) > 500) {
+                    return $content_after_title;
+                }
+            }
+        }
+        
+        // Third strategy: Find the largest paragraph group
+        $largest_group = $this->find_largest_paragraph_group($html);
+        if (!empty($largest_group) && strlen(strip_tags($largest_group)) > 300) {
+            return $largest_group;
+        }
+        
+        return $best_match;
+    }
+    
+    /**
+     * Extract the page title from HTML
+     */
+    private function extract_page_title($html) {
+        // Try title tag first
+        if (preg_match('/<title>(.*?)<\/title>/is', $html, $matches)) {
+            return trim($matches[1]);
+        }
+        
+        // Try h1 tag
+        if (preg_match('/<h1[^>]*>(.*?)<\/h1>/is', $html, $matches)) {
+            return trim(strip_tags($matches[1]));
+        }
+        
+        return '';
+    }
+    
+    /**
+     * Find the largest group of paragraphs in the HTML
+     */
+    private function find_largest_paragraph_group($html) {
+        if (preg_match_all('/<p(?:\s+[^>]*)?>(.*?)<\/p>/is', $html, $matches)) {
+            // Find sequences of paragraphs
+            $p_groups = array();
+            $current_group = '';
+            $p_count = 0;
+            $last_p_pos = -1;
+            
+            // Get the position of each paragraph
+            $positions = array();
+            foreach ($matches[0] as $idx => $p) {
+                $pos = strpos($html, $p);
+                if ($pos !== false) {
+                    $positions[$idx] = $pos;
+                }
+            }
+            
+            // Group paragraphs together if they're close to each other
+            foreach ($matches[0] as $idx => $p) {
+                if ($last_p_pos == -1 || ($positions[$idx] - $last_p_pos) < 500) {
+                    // Paragraphs are close, add to current group
+                    $current_group .= $p;
+                    $p_count++;
+        } else {
+                    // Too far from last paragraph, start a new group
+                    if ($p_count > 1) {
+                        $p_groups[] = $current_group;
+                    }
+                    $current_group = $p;
+                    $p_count = 1;
+                }
+                $last_p_pos = $positions[$idx] + strlen($p);
+            }
+            
+            // Add the last group
+            if ($p_count > 1) {
+                $p_groups[] = $current_group;
+            }
+            
+            // Find the largest group
+            $best_group = '';
+            $best_size = 0;
+            foreach ($p_groups as $group) {
+                $clean_size = strlen(strip_tags($group));
+                if ($clean_size > $best_size) {
+                    $best_size = $clean_size;
+                    $best_group = $group;
+                }
+            }
+            
+            if (!empty($best_group)) {
+                return $best_group;
+            }
+        }
+        
+        return '';
+    }
+    
+    /**
+     * Extract all paragraphs from body for basic content extraction
+     */
+    private function extract_body_paragraphs($html) {
+        // Remove common non-content areas
+        $cleaned_html = preg_replace('/<header(?:\s+[^>]*)?>(.*?)<\/header>/is', '', $html);
+        $cleaned_html = preg_replace('/<footer(?:\s+[^>]*)?>(.*?)<\/footer>/is', '', $cleaned_html);
+        $cleaned_html = preg_replace('/<nav(?:\s+[^>]*)?>(.*?)<\/nav>/is', '', $cleaned_html);
+        $cleaned_html = preg_replace('/<aside(?:\s+[^>]*)?>(.*?)<\/aside>/is', '', $cleaned_html);
+        
+        // First try finding all paragraphs - get ALL of them this time
+        $all_paragraphs = '';
+        if (preg_match_all('/<p(?:\s+[^>]*)?>(.*?)<\/p>/is', $cleaned_html, $matches)) {
+            foreach ($matches[0] as $idx => $p) {
+                $text = strip_tags($matches[1][$idx]);
+                
+                // Filter out very short paragraphs or typical footer text
+                if (strlen($text) > 10 && 
+                    !preg_match('/^\s*copyright|^\s*©|^\s*all rights reserved|^\s*privacy policy/i', $text)) {
+                    $all_paragraphs .= $p . "\n";
+                }
+            }
+            
+            if (!empty($all_paragraphs)) {
+                return $all_paragraphs;
+            }
+        }
+        
+        // If we couldn't find paragraphs, try extracting any text blocks
+        if (preg_match('/<body[^>]*>(.*)<\/body>/is', $html, $body_matches)) {
+            $body = $body_matches[1];
+            
+            // Remove script, style, header, footer, nav
+            $body = preg_replace('/<script[^>]*>.*?<\/script>/is', '', $body);
+            $body = preg_replace('/<style[^>]*>.*?<\/style>/is', '', $body);
+            $body = preg_replace('/<header[^>]*>.*?<\/header>/is', '', $body);
+            $body = preg_replace('/<footer[^>]*>.*?<\/footer>/is', '', $body);
+            $body = preg_replace('/<nav[^>]*>.*?<\/nav>/is', '', $body);
+            
+            // Extract text and wrap in paragraphs
+            $content = '';
+            $text_blocks = preg_split('/<\/?(?:div|section|article|aside|header|footer|nav)[^>]*>/i', $body);
+            foreach ($text_blocks as $block) {
+                // Skip empty blocks
+                if (empty(trim(strip_tags($block)))) {
+                    continue;
+                }
+                
+                // If it already has tags, keep them
+                if (strpos($block, '<') !== false) {
+                    $content .= $block;
+                } else {
+                    // Wrap plain text in paragraphs
+                    $text = trim($block);
+                    if (!empty($text)) {
+                        $content .= "<p>{$text}</p>\n";
+                    }
+                }
+            }
+            
+            if (!empty($content)) {
+                return $content;
+            }
+        }
+        
+        return '';
+    }
+
+    /**
+     * Clean HTML content by removing unwanted elements
+     */
+    private function clean_html_content($content) {
+        // Log content size before cleaning for debug
+        error_log("MIGRATION: Before clean_html_content processing - Content size: " . strlen($content) . " bytes");
+        
+        // Store original content for reference if needed
+        $original_content = $content;
+        
+        // ENHANCED: More aggressive form removal - remove entire sections containing forms
+        // First find all forms and their parent containers
+        if (preg_match_all('/<form\b[^>]*>.*?<\/form>/is', $content, $form_matches, PREG_OFFSET_CAPTURE)) {
+            error_log("MIGRATION: Found " . count($form_matches[0]) . " forms to remove from content");
+            
+            // Process forms from last to first to prevent offset issues
+            $form_matches[0] = array_reverse($form_matches[0]);
+            
+            foreach ($form_matches[0] as $form_match) {
+                $form_html = $form_match[0];
+                $form_pos = $form_match[1];
+                
+                // Try to find parent containers (up to 5 levels) that might contain the form
+                $parent_found = false;
+                
+                // Look for larger container elements containing the form
+                foreach (array('div', 'section', 'article', 'main', 'aside') as $parent_tag) {
+                    // First try to find a higher level container with a contact/form related class
+                    $parent_pattern = '/<' . $parent_tag . '\b[^>]*(?:class|id)=["\'][^"\']*(?:contact|form|consult|inquiry)[^"\']*["\'][^>]*>(?:(?!<\/' . $parent_tag . '>).)*' . 
+                                       preg_quote(substr($form_html, 0, 50), '/') . '.*?<\/' . $parent_tag . '>/is';
+                    
+                    // Look up to 3000 chars before form to find container
+                    $search_start = max(0, $form_pos - 3000);
+                    $search_length = strlen($form_html) + 6000; // Look up to 3000 chars after form
+                    $search_segment = substr($content, $search_start, $search_length);
+                    
+                    if (preg_match($parent_pattern, $search_segment, $parent_matches, PREG_OFFSET_CAPTURE)) {
+                        $parent_html = $parent_matches[0][0];
+                        $parent_relpos = $parent_matches[0][1]; 
+                        $parent_abspos = $search_start + $parent_relpos;
+                        
+                        // Make sure the parent isn't too large (might be main content)
+                        if (strlen($parent_html) < strlen($content) * 0.8) {
+                            // Remove the entire parent container
+                            $content = substr_replace($content, '', $parent_abspos, strlen($parent_html));
+                            $parent_found = true;
+                            error_log("MIGRATION: Removed entire contact form section with <{$parent_tag}> container (" . strlen($parent_html) . " bytes)");
+                            break;
+                        }
+                    }
+                    
+                    // If we didn't find a classed container, try to find any container
+                    if (!$parent_found) {
+                        $parent_pattern = '/<' . $parent_tag . '\b[^>]*>(?:(?!<\/' . $parent_tag . '>).)*' . 
+                                           preg_quote(substr($form_html, 0, 50), '/') . '.*?<\/' . $parent_tag . '>/is';
+                        
+                        if (preg_match($parent_pattern, $search_segment, $parent_matches, PREG_OFFSET_CAPTURE)) {
+                            $parent_html = $parent_matches[0][0];
+                            $parent_relpos = $parent_matches[0][1]; 
+                            $parent_abspos = $search_start + $parent_relpos;
+                            
+                            // Check if this container has contact-related text or headings
+                            $is_contact_section = preg_match('/contact|consult|get in touch|schedule|appointment|free case|request info/i', $parent_html);
+                            
+                            // Make sure the parent isn't too large (might be main content)
+                            if ($is_contact_section && strlen($parent_html) < strlen($content) * 0.8) {
+                                // Remove the entire parent container
+                                $content = substr_replace($content, '', $parent_abspos, strlen($parent_html));
+                                $parent_found = true;
+                                error_log("MIGRATION: Removed contact form section with generic <{$parent_tag}> container (" . strlen($parent_html) . " bytes)");
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // If no suitable parent container found, try to find a section with contact heading
+                if (!$parent_found) {
+                    $form_section_pattern = '/<(?:div|section|article)[^>]*>(?:(?!<\/(?:div|section|article)>).)*(?:<h[1-6][^>]*>(?:(?!<\/h[1-6]>).)*(?:contact|consult|get in touch|free case|request)(?:(?!<\/h[1-6]>).)*<\/h[1-6]>)(?:(?!<\/(?:div|section|article)>).)*' . preg_quote(substr($form_html, 0, 50), '/') . '.*?<\/(?:div|section|article)>/is';
+                    
+                    $search_start = max(0, $form_pos - 3000);
+                    $search_segment = substr($content, $search_start, strlen($form_html) + 6000);
+                    
+                    if (preg_match($form_section_pattern, $search_segment, $section_matches, PREG_OFFSET_CAPTURE)) {
+                        $section_html = $section_matches[0][0];
+                        $section_relpos = $section_matches[0][1]; 
+                        $section_abspos = $search_start + $section_relpos;
+                        
+                        if (strlen($section_html) < strlen($content) * 0.8) {
+                            $content = substr_replace($content, '', $section_abspos, strlen($section_html));
+                            $parent_found = true;
+                            error_log("MIGRATION: Removed contact section with heading (" . strlen($section_html) . " bytes)");
+                        }
+                    }
+                }
+                
+                // If still no parent found, just remove the form itself
+                if (!$parent_found) {
+                    $content = substr_replace($content, '', $form_pos, strlen($form_html));
+                    error_log("MIGRATION: Removed standalone form (" . strlen($form_html) . " bytes)");
+                }
+            }
+        }
+        
+        // Now identify and remove common contact form sections even without <form> tags
+        // This will catch contact forms built with divs and inputs without actual form tags
+        $contact_section_patterns = array(
+            // Target the exact heading patterns shown in the screenshot - more precise
+            '/<(?:div|section|h[1-6])[^>]*>\s*Ask\s+a\s+Question,\s*Describe\s+Your\s+Situation,\s*Request\s+a\s+Consultation\s*<\/(?:div|section|h[1-6])>(?:(?:.|\n)*?<form[^>]*>(?:.|\n)*?<\/form>){0,1}/is',
+            
+            // Match the "Contact Us Today For a Free Case Consultation" pattern - only with forms
+            '/<(?:div|section|h[1-6]|p)[^>]*>\s*Contact\s+Us\s+Today\s+For\s+a\s+Free\s+Case\s+Consultation\s*<\/(?:div|section|h[1-6]|p)>(?:(?:.|\n)*?<form[^>]*>(?:.|\n)*?<\/form>){0,1}/is',
+            
+            // ONLY target form-specific elements, not entire sections
+            '/<form\b[^>]*>.*?<\/form>/is',
+            
+            // Target LIVE CHAT widget only
+            '/<div[^>]*>\s*LIVE\s+CHAT\s*<\/div>/is',
+            '/<div[^>]*class=["\'][^"\']*\blive-?chat\b[^"\']*["\']((?:.|\n)*?)<\/div>/is',
+        );
+        
+        foreach ($contact_section_patterns as $pattern) {
+            // Apply each pattern and track the number of replacements
+            $content = preg_replace_callback($pattern, function($matches) {
+                error_log("MIGRATION: Removed contact form element (" . strlen($matches[0]) . " bytes)");
+                return '';
+            }, $content, -1, $count);
+            
+            if ($count > 0) {
+                error_log("MIGRATION: Removed $count contact form elements with pattern");
+            }
+        }
+        
+        // SAFETY CHECK: If the content is now too small, restore from original
+        if (isset($original_content) && strlen(strip_tags($content)) < 100 && strlen(strip_tags($original_content)) > 300) {
+            error_log("MIGRATION WARNING: Content cleaning was too aggressive, restoring and using minimal cleaning");
+            
+            // Restore content and only remove actual form elements
+            $content = $original_content;
+            
+            // Only remove these specific elements
+            $safe_patterns = array(
+                // Actual form tags
+                '/<form\b[^>]*>.*?<\/form>/is',
+                
+                // Live chat
+                '/<div[^>]*>\s*LIVE\s+CHAT\s*<\/div>/is',
+                '/<div[^>]*class=["\'][^"\']*\blive-?chat\b[^"\']*["\']((?:.|\n)*?)<\/div>/is',
+                
+                // Scripts and styles
+                '/<script\b[^>]*>.*?<\/script>/is',
+                '/<style\b[^>]*>.*?<\/style>/is',
+                
+                // Comments
+                '/<!--(.*?)-->/s',
+            );
+            
+            foreach ($safe_patterns as $pattern) {
+                $content = preg_replace($pattern, '', $content);
+            }
+        }
+        
+        // NEW APPROACH: If forms exist, find and remove their parent containers
+        if (preg_match_all('/<form\b[^>]*>.*?<\/form>/is', $content, $form_matches, PREG_OFFSET_CAPTURE)) {
+            error_log("MIGRATION: Found " . count($form_matches[0]) . " forms to process with new approach");
+            
+            // Process forms from last to first to avoid offset issues
+            $form_matches[0] = array_reverse($form_matches[0]);
+            
+            foreach ($form_matches[0] as $form_match) {
+                $form_html = $form_match[0];
+                $form_pos = $form_match[1];
+                
+                // Get substring before the form to find parent divs
+                $content_before = substr($content, 0, $form_pos);
+                
+                // Find all div opening tags before this form
+                if (preg_match_all('/<div[^>]*>/is', $content_before, $open_divs, PREG_OFFSET_CAPTURE)) {
+                    // Get the closest opening div (last one before the form)
+                    $open_divs[0] = array_reverse($open_divs[0]);
+                    
+                    // Look at up to 3 potential parent divs
+                    $potential_parents = array_slice($open_divs[0], 0, 3);
+                    $form_processed = false;
+                    
+                    foreach ($potential_parents as $parent_div) {
+                        $parent_open_tag = $parent_div[0];
+                        $parent_open_pos = $parent_div[1];
+                        
+                        // Extract content between parent open tag and form
+                        $interim_content = substr($content, $parent_open_pos, $form_pos - $parent_open_pos);
+                        
+                        // Count nested divs in this section - to avoid removing too much
+                        $open_count = substr_count($interim_content, '<div');
+                        $close_count = substr_count($interim_content, '</div');
+                        
+                        // If nesting level looks good (balanced or few levels deep)
+                        if ($open_count - $close_count <= 3) {
+                            // Get content after form to find the matching closing div
+                            $content_after = substr($content, $form_pos + strlen($form_html));
+                            
+                            // Need to find the right number of closing divs to match our opening div
+                            $needed_closings = $open_count - $close_count + 1;
+                            
+                            $close_pos = 0;
+                            $current_depth = 0;
+                            $close_tags_found = 0;
+                            
+                            // Find the corresponding closing div position
+                            preg_match_all('/<\/?div[^>]*>/is', $content_after, $div_tags, PREG_OFFSET_CAPTURE);
+                            
+                            foreach ($div_tags[0] as $tag) {
+                                if (strpos($tag[0], '</div') === 0) {
+                                    $close_tags_found++;
+                                    if ($close_tags_found == $needed_closings) {
+                                        $close_pos = $tag[1] + 6; // 6 = length of "</div>"
+                                        break;
+                                    }
+                                } else {
+                                    // This is an opening tag, so we need one more closing tag
+                                    $needed_closings++;
+                                }
+                            }
+                            
+                            if ($close_pos > 0) {
+                                // Calculate the full parent div with its content
+                                $parent_full_length = $close_pos + ($form_pos + strlen($form_html)) - $parent_open_pos;
+                                $parent_full_html = substr($content, $parent_open_pos, $parent_full_length);
+                                
+                                // Only remove if this doesn't look like a main content div
+                                // Check size and for certain class/id patterns
+                                $is_main_content = false;
+                                
+                                // Check for main content indicators
+                                if (preg_match('/class=["\'][^"\']*\b(?:content|main|entry|post|page|article)\b/i', $parent_open_tag)) {
+                                    $is_main_content = true;
+                                }
+                                
+                                // Check if it's too large (might be main content)
+                                if (strlen($parent_full_html) > strlen($content) * 0.5) {
+                                    $is_main_content = true;
+                                }
+                                
+                                if (!$is_main_content) {
+                                    // Replace the parent div and all its content
+                                    $content = substr_replace($content, '', $parent_open_pos, $parent_full_length);
+                                    error_log("MIGRATION: Removed form parent container (" . strlen($parent_full_html) . " bytes)");
+                                    $form_processed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // If we couldn't process the form by finding a suitable parent, just remove the form itself
+                    if (!$form_processed) {
+                        // Just remove the form without affecting surrounding content
+                        $content = substr_replace($content, '', $form_pos, strlen($form_html));
+                        error_log("MIGRATION: Removed only the form element itself (" . strlen($form_html) . " bytes)");
+                    }
+                } else {
+                    // If we couldn't find parent divs, just remove the form
+                    $content = substr_replace($content, '', $form_pos, strlen($form_html));
+                    error_log("MIGRATION: Removed standalone form (" . strlen($form_html) . " bytes)");
+                }
+            }
+        }
+        
+        // Remove ONLY form elements and not surrounding content
+        $form_element_patterns = array(
+            // Input elements
+            '/<input[^>]*type=["\'](?:text|email|tel|number|submit|reset|password|file|hidden)["\'][^>]*>/is',
+            
+            // Textareas
+            '/<textarea[^>]*>.*?<\/textarea>/is',
+            
+            // Select dropdowns
+            '/<select[^>]*>.*?<\/select>/is',
+            
+            // Submit buttons
+            '/<button[^>]*type=["\']submit["\'][^>]*>.*?<\/button>/is',
+            
+            // Labels
+            '/<label[^>]*>.*?<\/label>/is',
+        );
+        
+        foreach ($form_element_patterns as $pattern) {
+            $content = preg_replace($pattern, '', $content);
+        }
+        
+        // Now continue with regular content cleaning
+        // Store original paragraphs to check if any are lost
+        preg_match_all('/<p(?:\s+[^>]*)?>(.*?)<\/p>/is', $content, $original_paragraphs);
+        $original_p_count = count($original_paragraphs[0]);
+        error_log("MIGRATION: Number of paragraphs before cleaning: " . $original_p_count);
+        
+        // REMOVE ALL H1 TAGS AGAIN - redundant check
+        $content = preg_replace('/<h1[^>]*>.*?<\/h1>/is', '', $content);
+        
+        // First remove unnecessary blocks/elements
+        // Remove unnecessary scripts
+        $content = preg_replace('/<script\b[^>]*>(.*?)<\/script>/is', '', $content);
+        
+        // Remove style blocks
+        $content = preg_replace('/<style\b[^>]*>(.*?)<\/style>/is', '', $content);
+        
+        // Remove comments
+        $content = preg_replace('/<!--(.*?)-->/s', '', $content);
+        
+        // ENHANCED: More aggressive menu removal - target all navigation/menu elements
+        $content = preg_replace('/<nav\b[^>]*>.*?<\/nav>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*\b(menu|navigation|navbar|main-menu|header-menu|top-menu|primary-menu)\b[^"\']*["\'](.*?)>.*?<\/div>/is', '', $content);
+        $content = preg_replace('/<ul\b[^>]*class=["\'][^"\']*\b(menu|nav|navigation|navbar-nav)\b[^"\']*["\'](.*?)>.*?<\/ul>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*id=["\'][^"\']*\b(menu|nav|navigation)\b[^"\']*["\'](.*?)>.*?<\/div>/is', '', $content);
+        
+        // Remove header and footer elements if they exist within the content
+        $content = preg_replace('/<header\b[^>]*>.*?<\/header>/is', '', $content);
+        $content = preg_replace('/<footer\b[^>]*>.*?<\/footer>/is', '', $content);
+        
+        // ENHANCED: Remove banner sections that often appear at the top
+        $content = preg_replace('/<section\b[^>]*class=["\'][^"\']*banner[^"\']*["\'](.*?)>(.*?)<\/section>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*banner[^"\']*["\'](.*?)>(.*?)<\/div>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*hero[^"\']*["\'](.*?)>(.*?)<\/div>/is', '', $content);
+        $content = preg_replace('/<section\b[^>]*class=["\'][^"\']*hero[^"\']*["\'](.*?)>(.*?)<\/section>/is', '', $content);
+        
+        // More aggressive removal of related posts/articles sections with pattern matching
+        // This includes finding common section titles and removing everything after them
+        $section_patterns = array(
+            // Common headings for related content
+            '<h[2-6][^>]*>Related\s+(?:Articles|Posts|Blogs|Stories|Content|Resources|News|Topics)<\/h[2-6]>',
+            '<h[2-6][^>]*>Recent\s+(?:Articles|Posts|Blogs|Stories|Content|Publications|News)<\/h[2-6]>',
+            '<h[2-6][^>]*>Latest\s+(?:Articles|Posts|Blogs|Stories|Content|News)<\/h[2-6]>',
+            '<h[2-6][^>]*>You\s+(?:Might|May)\s+Also\s+(?:Like|Enjoy|Be Interested In)<\/h[2-6]>',
+            '<h[2-6][^>]*>More\s+(?:Articles|Posts|Blogs|Stories|Content|News|Resources|Topics|Like This)<\/h[2-6]>',
+            '<h[2-6][^>]*>Similar\s+(?:Articles|Posts|Blogs|Stories|Content|Topics)<\/h[2-6]>',
+            '<h[2-6][^>]*>Additional\s+(?:Resources|Articles|Posts|Information)<\/h[2-6]>',
+            '<h[2-6][^>]*>Recommended\s+(?:Articles|Posts|Blogs|Reading|Resources)<\/h[2-6]>',
+            '<h[2-6][^>]*>Other\s+(?:Articles|Posts|Blogs|Stories|Content|Topics|Resources)<\/h[2-6]>',
+
+            // Common div classes/IDs for related content sections
+            '<div[^>]*(?:id|class)=["\'][^"\']*related[^"\']*["\'][^>]*>',
+            '<div[^>]*(?:id|class)=["\'][^"\']*similar[^"\']*["\'][^>]*>',
+            '<div[^>]*(?:id|class)=["\'][^"\']*recent-post[^"\']*["\'][^>]*>',
+            '<div[^>]*(?:id|class)=["\'][^"\']*blog-list[^"\']*["\'][^>]*>',
+            '<div[^>]*(?:id|class)=["\'][^"\']*latest-post[^"\']*["\'][^>]*>',
+            '<div[^>]*(?:id|class)=["\'][^"\']*more-articles[^"\']*["\'][^>]*>',
+            '<div[^>]*(?:id|class)=["\'][^"\']*recommended[^"\']*["\'][^>]*>',
+            
+            // Common section titles in different formats
+            '<strong[^>]*>Related\s+(?:Articles|Posts|Blogs|Stories|Content)<\/strong>',
+            '<p[^>]*>\s*Related\s+(?:Articles|Posts|Blogs|Stories|Content|Resources)\s*<\/p>',
+            '<p[^>]*>\s*Recent\s+(?:Articles|Posts|Blogs|Stories|Content|News)\s*<\/p>',
+            
+            // Our Latest Blogs specific pattern
+            '<div[^>]*>Our Latest Blogs<\/div>',
+            '<h[2-6][^>]*>Our Latest Blogs<\/h[2-6]>',
+            '<p[^>]*>Our Latest Blogs<\/p>',
+            '<strong[^>]*>Our Latest Blogs<\/strong>',
+            
+            // Related Blog Posts specific pattern
+            '<div[^>]*>Related Blog Posts<\/div>',
+            '<h[2-6][^>]*>Related Blog Posts<\/h[2-6]>',
+            '<p[^>]*>Related Blog Posts<\/p>',
+            '<strong[^>]*>Related Blog Posts<\/strong>'
+        );
+        
+        // Search for patterns and truncate content at the match
+        foreach ($section_patterns as $pattern) {
+            if (preg_match('/' . $pattern . '/is', $content, $matches, PREG_OFFSET_CAPTURE)) {
+                // Found a match - trim content up to this point
+                $match_position = $matches[0][1];
+                $content = substr($content, 0, $match_position);
+                error_log("MIGRATION: Truncated content at pattern: " . $pattern);
+                break; // Exit after first truncation
+            }
+        }
+        
+        // ENHANCED: Remove related blogs sections - more aggressive patterns
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*related[^"\']*["\'](.*?)>(.*?)<\/div>/is', '', $content);
+        $content = preg_replace('/<section\b[^>]*class=["\'][^"\']*related[^"\']*["\'](.*?)>(.*?)<\/section>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*id=["\']related[^"\']*["\'](.*?)>(.*?)<\/div>/is', '', $content);
+        $content = preg_replace('/<section\b[^>]*id=["\']related[^"\']*["\'](.*?)>(.*?)<\/section>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*\b(related-posts|related-articles|related-content)\b[^"\']*["\'](.*?)>.*?<\/div>/is', '', $content);
+        $content = preg_replace('/<section\b[^>]*class=["\'][^"\']*\b(related-posts|related-articles|related-content)\b[^"\']*["\'](.*?)>.*?<\/section>/is', '', $content);
+        
+        // ENHANCED: Remove latest articles/posts sections - more patterns
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*latest[^"\']*["\'](.*?)>(.*?)<\/div>/is', '', $content);
+        $content = preg_replace('/<section\b[^>]*class=["\'][^"\']*latest[^"\']*["\'](.*?)>(.*?)<\/section>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*recent[^"\']*["\'](.*?)>(.*?)<\/div>/is', '', $content);
+        $content = preg_replace('/<section\b[^>]*class=["\'][^"\']*recent[^"\']*["\'](.*?)>(.*?)<\/section>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*\b(blog-posts|recent-posts|latest-posts|latest-articles|blog-list)\b[^"\']*["\'](.*?)>.*?<\/div>/is', '', $content);
+        $content = preg_replace('/<section\b[^>]*class=["\'][^"\']*\b(blog-posts|recent-posts|latest-posts|latest-articles|blog-list)\b[^"\']*["\'](.*?)>.*?<\/section>/is', '', $content);
+        $content = preg_replace('/<aside\b[^>]*class=["\'][^"\']*\b(blog|sidebar)\b[^"\']*["\'](.*?)>.*?<\/aside>/is', '', $content);
+        
+        // ENHANCED: Additional common patterns for blog sections
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*\b(blog|posts|articles)\b[^"\']*["\'](.*?)>.*?<\/div>/is', '', $content);
+        
+        // Remove social sharing buttons and widgets that are often found in content
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*share[^"\']*["\'](.*?)>(.*?)<\/div>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*social[^"\']*["\'](.*?)>(.*?)<\/div>/is', '', $content);
+        $content = preg_replace('/<div\b[^>]*class=["\'][^"\']*widget[^"\']*["\'](.*?)>(.*?)<\/div>/is', '', $content);
+        
+        // ENHANCED: Preserve iframe elements for videos (YouTube, Vimeo, etc.) but process them
+        $videos = array();
+        if (preg_match_all('/<iframe\b[^>]*src=["\']([^"\']*(?:youtube|vimeo|dailymotion)[^"\']*)["\'](.*?)><\/iframe>/is', $content, $iframe_matches, PREG_SET_ORDER)) {
+            foreach ($iframe_matches as $index => $match) {
+                $placeholder = "<!--VIDEO_PLACEHOLDER_{$index}-->";
+                $videos[$placeholder] = $match[0];
+                $content = str_replace($match[0], $placeholder, $content);
+            }
+        }
+        
+        // Remove other iframes that aren't videos
+        $content = preg_replace('/<iframe\b[^>]*>(.*?)<\/iframe>/is', '', $content);
+        
+        // Remove menu items - more aggressive
+        $content = preg_replace('/<ul\b[^>]*class=["\'][^"\']*menu[^"\']*["\'](.*?)>(.*?)<\/ul>/is', '', $content);
+        $content = preg_replace('/<ul\b[^>]*id=["\'][^"\']*menu[^"\']*["\'](.*?)>(.*?)<\/ul>/is', '', $content);
+        
+        // Strip all class, id, and style attributes from all tags
+        $content = $this->strip_attributes($content);
+        
+        // Remove empty tags, but not <img>, <br>, <hr> which are naturally empty
+        $content = preg_replace('/<(?!img|br|hr|input\b)([a-z]+)[^>]*>([\s]*)<\/\1>/is', '', $content);
+        
+        // Replace div tags with paragraph tags when appropriate
+        $content = preg_replace('/<div>(.*?)<\/div>/is', '<p>$1</p>', $content);
+        
+        // Remove span tags but keep their content
+        $content = preg_replace('/<span[^>]*>(.*?)<\/span>/is', '$1', $content);
+        
+        // Remove excessive nesting of divs
+        $content = $this->reduce_div_nesting($content);
+        
+        // Fix potential broken HTML
+        $content = $this->fix_broken_html($content);
+        
+        // Clean up any excessive whitespace
+        $content = preg_replace('/\s+/', ' ', $content);
+        $content = str_replace('> <', '><', $content);
+        
+        // Replace video placeholders
+        foreach ($videos as $placeholder => $video) {
+            $content = str_replace($placeholder, $video, $content);
+        }
+        
+        // Check for paragraph count after cleaning
+        preg_match_all('/<p(?:\s+[^>]*)?>(.*?)<\/p>/is', $content, $cleaned_paragraphs);
+        $cleaned_p_count = count($cleaned_paragraphs[0]);
+        error_log("MIGRATION: Number of paragraphs after cleaning: " . $cleaned_p_count);
+        
+        // Final clean with wp_kses to ensure safe HTML
+        $allowed_html = array(
+            'p' => array(),
+            'span' => array(),
+            'br' => array(),
+            'strong' => array(),
+            'em' => array(),
+            'b' => array(),
+            'i' => array(),
+            'ul' => array(),
+            'ol' => array(),
+            'li' => array(),
+            'h2' => array(),
+            'h3' => array(),
+            'h4' => array(),
+            'h5' => array(),
+            'h6' => array(),
+            'blockquote' => array(),
+            'img' => array(
+                'src' => array(),
+                'alt' => array(),
+                'width' => array(),
+                'height' => array(),
+            ),
+            'a' => array(
+                'href' => array(),
+                'title' => array(),
+                'target' => array(),
+            ),
+            'iframe' => array(
+                'src' => array(),
+                'width' => array(),
+                'height' => array(),
+                'frameborder' => array(),
+                'allowfullscreen' => array(),
+            ),
+        );
+        
+        $content = wp_kses($content, $allowed_html);
+        
+        // REMOVE ALL H1 TAGS ONE FINAL TIME
+        $content = preg_replace('/<h1[^>]*>.*?<\/h1>/is', '', $content);
+        
+        // ENHANCED SAFETY CHECK: If we've lost too much content, restore from original
+        if (isset($original_content) && strlen(strip_tags($content)) < strlen(strip_tags($original_content)) * 0.4) {
+            error_log("MIGRATION WARNING: Content cleaning was too aggressive, restoring from original");
+            
+            // Minimal cleaning to preserve content but remove forms
+            $content = $original_content;
+            $content = preg_replace('/<form\b[^>]*>.*?<\/form>/is', '', $content);
+            $content = preg_replace('/<script\b[^>]*>(.*?)<\/script>/is', '', $content);
+            $content = preg_replace('/<style\b[^>]*>(.*?)<\/style>/is', '', $content);
+            $content = preg_replace('/<iframe\b[^>]*>(.*?)<\/iframe>/is', '', $content);
+            $content = wp_kses($content, $allowed_html);
+        }
+        
+        // Log final content size for debug
+        error_log("MIGRATION: After clean_html_content processing - Content size: " . strlen($content) . " bytes");
+        
+        return $content;
+    }
+    
+    /**
+     * Strip all class, id, and style attributes from HTML
+     */
+    private function strip_attributes($html) {
+        // Load the HTML into DOMDocument for easier manipulation
+        $dom = new DOMDocument();
+        
+        // Suppress warnings from malformed HTML
+        libxml_use_internal_errors(true);
+        
+        // Ensure proper UTF-8 handling
+        $html = mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8');
+        
+        // Load the HTML
+        $dom->loadHTML('<div>' . $html . '</div>', LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        
+        // Get all elements
+        $xpath = new DOMXPath($dom);
+        $elements = $xpath->query('//*');
+        
+        // Remove unwanted attributes from all elements
+        foreach ($elements as $element) {
+            // Get all attributes
+            $attributes = $element->attributes;
+            $remove_attr = array();
+            
+            // Find attributes to remove
+            for ($i = 0; $i < $attributes->length; $i++) {
+                $attr = $attributes->item($i);
+                $attr_name = $attr->name;
+                
+                // Keep only essential attributes
+                if ($attr_name !== 'href' && $attr_name !== 'src' && 
+                    $attr_name !== 'alt' && $attr_name !== 'target' &&
+                    $attr_name !== 'width' && $attr_name !== 'height') {
+                    $remove_attr[] = $attr_name;
+                }
+            }
+            
+            // Remove the attributes
+            foreach ($remove_attr as $attr_name) {
+                $element->removeAttribute($attr_name);
+            }
+        }
+        
+        // Get the cleaned HTML
+        $body = $xpath->query('//body')->item(0);
+        $clean_html = '';
+        
+        // Extract all child nodes of the body
+        if ($body) {
+            foreach ($body->childNodes as $childNode) {
+                $clean_html .= $dom->saveHTML($childNode);
+            }
+        } else {
+            // Fallback if body not found
+            $clean_html = $dom->saveHTML();
+        }
+        
+        // Remove the wrapping div we added
+        $clean_html = preg_replace('/^<div>|<\/div>$/i', '', $clean_html);
+        
+        libxml_clear_errors();
+        
+        return $clean_html;
+    }
+    
+    /**
+     * Reduce excessive div nesting
+     */
+    private function reduce_div_nesting($html) {
+        // Simple pattern to reduce single-nested divs
+        $pattern = '/<div[^>]*>\s*<div[^>]*>(.*?)<\/div>\s*<\/div>/is';
+        $replacement = '<div>$1</div>';
+        
+        // Apply multiple times to handle deep nesting
+        $previous = '';
+        $current = $html;
+        
+        // Keep applying until no more changes
+        while ($previous !== $current) {
+            $previous = $current;
+            $current = preg_replace($pattern, $replacement, $previous);
+        }
+        
+        return $current;
+    }
+    
+    /**
+     * Fix broken HTML by balancing tags 
+     */
+    private function fix_broken_html($html) {
+        // Simple stack-based HTML tag balancer
+        $result = '';
+        $tag_stack = array();
+        
+        // Extract all tags
+        preg_match_all('/<\/?([a-z]+)[^>]*>/i', $html, $matches, PREG_OFFSET_CAPTURE);
+        
+        $last_pos = 0;
+        foreach ($matches[0] as $i => $match) {
+            $tag = $matches[1][$i][0];
+            $tag_pos = $match[1];
+            $tag_len = strlen($match[0]);
+            $is_closing = $match[0][1] === '/';
+            
+            // Add text before this tag
+            $result .= substr($html, $last_pos, $tag_pos - $last_pos);
+            
+            // Process tag
+            if (!$is_closing) {
+                // Self-closing tags
+                if (in_array(strtolower($tag), array('img', 'br', 'hr', 'input', 'meta', 'link'))) {
+                    $result .= $match[0];
+                } else {
+                    // Opening tag
+                    $result .= $match[0];
+                    array_unshift($tag_stack, $tag);
+                }
+            } else {
+                // Closing tag
+                if (!empty($tag_stack) && strtolower($tag_stack[0]) === strtolower($tag)) {
+                    // Matching closing tag
+                    $result .= $match[0];
+                    array_shift($tag_stack);
+                } else {
+                    // Ignored unmatched closing tag
+                }
+            }
+            
+            $last_pos = $tag_pos + $tag_len;
+        }
+        
+        // Add remaining text
+        $result .= substr($html, $last_pos);
+        
+        // Close any remaining open tags
+        foreach ($tag_stack as $tag) {
+            $result .= "</{$tag}>";
+        }
+        
+        return $result;
+    }
+
+    /**
+     * Prepare content by replacing h1 tags and adding new h1
+     */
+    private function prepare_content($content, $h1) {
+        // Log initial content metrics
+        error_log("MIGRATION: Processing content for page with H1: " . $h1 . ", original content size: " . strlen($content) . " bytes");
+        
+        // Replace existing h1 tags with strong
+        $content = preg_replace('/<h1(?:\s+[^>]*)?>(.*?)<\/h1>/is', '<strong>$1</strong>', $content);
+        
+        // Clean up any unwanted attributes
+        $h1_clean = wp_kses_post($h1);
+        
+        // Add new h1 at the top
+        $content = '<h1>' . $h1_clean . '</h1>' . $content;
+        error_log("MIGRATION: Added H1 tag to top of page content: " . $h1_clean);
+        
+        // Strip all classes, IDs, and inline styles one more time to ensure clean output
+        $content = $this->strip_attributes($content);
+        
+        // Log final content metrics
+        $content_size = strlen($content);
+        $text_size = strlen(strip_tags($content));
+        error_log("MIGRATION: Finished processing page content - HTML Size: {$content_size} bytes, Text size: {$text_size} chars");
+        
+        return $content;
+    }
+
+    /**
+     * Extract slug from URL
+     */
+    private function extract_slug($url) {
+        // Remove domain if present
+        if (strpos($url, 'http') === 0) {
+            $url_parts = parse_url($url);
+            $url = isset($url_parts['path']) ? $url_parts['path'] : $url;
+        }
+        
+        $url = trim($url, '/');
+        $parts = explode('/', $url);
+        return end($parts);
+    }
+
+    /**
+     * Determine parent page/post from URL structure
+     */
+    private function determine_parent($url, $post_type, $row_data = array()) {
+        // If we have a cached parent ID from the pre-processing step, use it
+        if (!empty($row_data) && isset($row_data['_cached_parent_id'])) {
+            return $row_data['_cached_parent_id'];
+        }
+        
+        // Static cache to avoid redundant lookups
+        static $parent_cache = array();
+        
+        $url = trim($url, '/');
+        
+        // If there's only one part, there's no parent
+        if (strpos($url, '/') === false) {
+            return 0;
+        }
+        
+        // Get parent path - this is the critical part
+        $parts = explode('/', $url);
+        
+        // Remove the last segment (current page slug)
+        array_pop($parts);
+        
+        // Build the parent path
+        $parent_path = implode('/', $parts);
+        
+        // Check cache first
+        $cache_key = $parent_path . '|' . $post_type;
+        if (isset($parent_cache[$cache_key])) {
+            return $parent_cache[$cache_key];
+        }
+        
+        // Find the parent post by exact path
+        $parent = get_page_by_path($parent_path, OBJECT, $post_type);
+        
+        // Debug output
+        if ($parent) {
+            error_log("MIGRATION PARENT: Found parent for '{$url}' at path '{$parent_path}': ID {$parent->ID}, Title: {$parent->post_title}");
+        } else {
+            error_log("MIGRATION PARENT: No parent found for '{$url}' at path '{$parent_path}'");
+        }
+        
+        $parent_id = $parent ? $parent->ID : 0;
+        
+        // Store result in cache
+        $parent_cache[$cache_key] = $parent_id;
+        
+        return $parent_id;
+    }
+
+    /**
+     * Generate and return a sample Excel file for download
+     */
+    public function generate_sample_excel() {
+        // Create CSV string in memory
+        $output = fopen('php://temp', 'r+');
+        
+        // Add formula instructions as comments in the first rows
+        fputcsv($output, array('# CONTENT MIGRATION TEMPLATE - INSTRUCTIONS'));
+        fputcsv($output, array('# 1. Open this CSV in Excel or Google Sheets'));
+        fputcsv($output, array('# 2. For automatic parent_url generation, paste this formula in column E (parent_url):'));
+        fputcsv($output, array('# =IF(LEN(D2)-LEN(SUBSTITUTE(D2,"/",""))<=2, "", LEFT(D2,FIND("~",SUBSTITUTE(D2,"/","~",LEN(D2)-LEN(SUBSTITUTE(D2,"/",""))-1))-1) & "/")'));
+        fputcsv($output, array('# 3. For posts, specify ONE category name in the "categories" column (no commas)'));
+        fputcsv($output, array('# 4. The "auto_categories" column (yes/no) determines whether to create categories from URL path segments'));
+        fputcsv($output, array('# 5. After applying formulas, copy the formula column and paste as values before saving as CSV'));
+        fputcsv($output, array('# 6. Delete these instruction rows before importing'));
+        fputcsv($output, array('# '));
+        
+        // Write header row with the requested column order
+        fputcsv($output, array(
+            'MIGRATE', 'type', 'old_url', 'new_url', 'parent_url', 'categories', 'auto_categories', 'h1', 'title', 'meta_title', 'featured_image', 'Process Images'
+        ));
+        
+        // Sample data rows in the new column order
+        // Parent pages
+        fputcsv($output, array(
+            'MIGRATE', 'page', 'https://example.com/spartanburg', '/spartanburg', '', '', 'no', 'Spartanburg', 'Spartanburg', 'Spartanburg | Example Site', 'auto', 'Yes'
+        ));
+        
+        fputcsv($output, array(
+            'MIGRATE', 'page', 'https://example.com/aiken', '/aiken', '', '', 'no', 'Aiken', 'Aiken', 'Aiken | Example Site', 'auto', 'Yes'
+        ));
+        
+        fputcsv($output, array(
+            'MIGRATE', 'page', 'https://example.com/services', '/services', '', '', 'no', 'Services', 'Our Services', 'Professional Services | Example Site', 'Yes', 'Yes'
+        ));
+        
+        // Child pages with parent_url
+        fputcsv($output, array(
+            'MIGRATE', 'page', 'https://example.com/spartanburg/car-accident', '/spartanburg/car-accident', '/spartanburg', '', 'no', 'Car Accident', 'Car Accident', 'Car Accident | Example Site', 'Yes', 'Yes'
+        ));
+        
+        fputcsv($output, array(
+            'MIGRATE', 'page', 'https://example.com/aiken/personal-injury', '/aiken/personal-injury', '/aiken', '', 'no', 'Personal Injury', 'Personal Injury', 'Personal Injury | Example Site', 'Yes', 'Yes'
+        ));
+        
+        // Deep child page
+        fputcsv($output, array(
+            'MIGRATE', 'page', 'https://example.com/spartanburg/car-accident/aggressive-driving', '/spartanburg/car-accident/aggressive-driving', '/spartanburg/car-accident', '', 'no', 'Aggressive Driving', 'Aggressive Driving', 'Aggressive Driving | Example Site', 'Yes', 'Yes'
+        ));
+        
+        // Blog posts with categories
+        fputcsv($output, array(
+            'MIGRATE', 'post', 'https://example.com/blog/first-post', '/blog/first-post', '', 'Blog', 'no', 'First Blog Post', 'First Blog Post', 'First Blog Post | Example Site', 'https://example.com/images/featured.jpg', 'Yes'
+        ));
+        
+        fputcsv($output, array(
+            'MIGRATE', 'post', 'https://example.com/blog/second-post', '/blog/second-post', '', 'Legal', 'no', 'Second Blog Post', 'Second Blog Post', 'Second Blog Post | Example Site', 'Yes', 'Yes'
+        ));
+        
+        // Post that uses auto-categories from URL
+        fputcsv($output, array(
+            'MIGRATE', 'post', 'https://example.com/law/personal-injury/latest-update', '/law/personal-injury/latest-update', '', '', 'yes', 'Latest Update', 'Latest Update', 'Latest Update | Example Site', 'Yes', 'Yes'
+        ));
+        
+        // Simple contact page
+        fputcsv($output, array(
+            'MIGRATE', 'page', 'https://example.com/contact', '/contact', '', '', 'no', 'Contact Us', 'Contact Our Team', 'Contact Our Team | Example Site', 'No', 'No'
+        ));
+        
+        // Get the CSV data as a string
+        rewind($output);
+        $csv_data = stream_get_contents($output);
+        fclose($output);
+        
+        // Set headers for download
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="content-migration-template.csv"');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+        
+        // Output the CSV
+        echo $csv_data;
+        exit;
+    }
+
+    /**
+     * Prepare content for posts (different from pages)
+     * - Uses H1 from Excel as post title
+     * - Removes ALL H1 tags from content
+     * - Removes meta title content duplication
+     * - Cleans all attributes, classes, IDs, and extra divs
+     */
+    private function prepare_post_content($content, $h1, $meta_title = '') {
+        // Verify post titles are not being accidentally processed as categories
+        if (!empty($h1)) {
+            $h1_slug = sanitize_title($h1);
+            
+            // Check if a category with this slug already exists that wasn't intended
+            $existing_category = get_term_by('slug', $h1_slug, 'category');
+            if ($existing_category) {
+                error_log("MIGRATION WARNING: Post title '{$h1}' may match an existing category. Make sure this is intentional.");
+            }
+        }
+    
+        // Log original content metrics
+        error_log("MIGRATION: Processing content for post with H1: " . $h1 . ", original content size: " . strlen($content) . " bytes");
+        
+        // Count paragraphs in original content for debugging
+        preg_match_all('/<p(?:\s+[^>]*)?>(.*?)<\/p>/is', $content, $original_paragraphs);
+        $original_p_count = count($original_paragraphs[0]);
+        if ($original_p_count > 0) {
+            error_log("MIGRATION: First paragraph in original content: " . substr(strip_tags($original_paragraphs[0][0]), 0, 50) . "...");
+        }
+        error_log("MIGRATION: Number of paragraphs in original content: " . $original_p_count);
+        
+        // Store original content for comparison and fallback
+        $original_content = $content;
+        
+        // ENHANCED: Aggressive removal of navigation, menu, sidebar, and header/footer elements
+        // This is critical for posts which often have these elements incorrectly included
+        $content = preg_replace('/<nav\b[^>]*>.*?<\/nav>/is', '', $content);
+        $content = preg_replace('/<header\b[^>]*>.*?<\/header>/is', '', $content);
+        $content = preg_replace('/<footer\b[^>]*>.*?<\/footer>/is', '', $content);
+        $content = preg_replace('/<aside\b[^>]*>.*?<\/aside>/is', '', $content);
+        
+        // Remove menus, navigation, and sidebar elements by class/id
+        $content = preg_replace('/<[^>]*class=["\'][^"\']*\b(menu|navigation|navbar|sidebar|widget)\b[^"\']*["\'](.*?)>.*?<\/[^>]*>/is', '', $content);
+        $content = preg_replace('/<[^>]*id=["\'][^"\']*\b(menu|navigation|navbar|sidebar|widget)\b[^"\']*["\'](.*?)>.*?<\/[^>]*>/is', '', $content);
+        
+        // Remove list elements that might be menus
+        if (preg_match_all('/<ul\b[^>]*>(.*?)<\/ul>/is', $content, $ul_matches)) {
+            foreach ($ul_matches[0] as $index => $ul) {
+                // If UL contains many short LI elements, it's likely a menu
+                if (substr_count($ul, '<li') > 3 && strlen($ul) < 1000) {
+                    $content = str_replace($ul, '', $content);
+                }
+            }
+        }
+        
+        // First clean the HTML content to remove classes, IDs, etc.
+        $content = $this->clean_html_content($content);
+        error_log("MIGRATION: Post content size after initial cleaning: " . strlen($content) . " bytes");
+        
+        // 1. Remove all H1 tags from content (because post title is used as H1)
+        $content = preg_replace('/<h1(?:\s+[^>]*)?>(.*?)<\/h1>/is', '', $content);
+        
+        // 2. Only remove exact matches of meta title or H1, using very specific matching
+        // IMPORTANT: Only if they're at the beginning of the content
+        if (!empty($meta_title)) {
+            $meta_title_escaped = preg_quote(trim($meta_title), '/');
+            $content = preg_replace('/^<p(?:\s+[^>]*)?>\s*' . $meta_title_escaped . '\s*<\/p>/is', '', $content, 1);
+            $content = preg_replace('/^<strong(?:\s+[^>]*)?>\s*' . $meta_title_escaped . '\s*<\/strong>/is', '', $content, 1);
+        }
+        
+        if (!empty($h1)) {
+            $h1_escaped = preg_quote(trim($h1), '/');
+            $content = preg_replace('/^<p(?:\s+[^>]*)?>\s*' . $h1_escaped . '\s*<\/p>/is', '', $content, 1);
+            $content = preg_replace('/^<strong(?:\s+[^>]*)?>\s*' . $h1_escaped . '\s*<\/strong>/is', '', $content, 1);
+        }
+        
+        // 3. Remove common title patterns but ONLY if they appear at the very beginning
+        $content = $this->remove_common_title_patterns($content);
+        
+        // 4. Only remove obvious author bylines at the end of content
+        $content = preg_replace('/<p(?:\s+[^>]*)?>\s*by\s+[^<]{1,50}<\/p>$/is', '', $content, 1);
+        $content = preg_replace('/<p(?:\s+[^>]*)?>\s*posted\s+(?:on|by)\s+[^<]{1,50}<\/p>$/is', '', $content, 1);
+        
+        // 5. ENHANCED: Remove any "Related Posts" or "Recent Posts" sections
+        $content = preg_replace('/<(?:div|section|aside)[^>]*>\s*<h[2-6][^>]*>\s*Related\s+(?:Posts|Articles|Blogs).*?<\/(?:div|section|aside)>/is', '', $content);
+        $content = preg_replace('/<(?:div|section|aside)[^>]*>\s*<h[2-6][^>]*>\s*Recent\s+(?:Posts|Articles|Blogs).*?<\/(?:div|section|aside)>/is', '', $content);
+        
+        // Basic document structure improvements
+        $content = $this->reduce_div_nesting($content);
+        $content = preg_replace('/<div>(.*?)<\/div>/is', '<p>$1</p>', $content);
+        
+        // Strip excess attributes but keep some essential ones
+        $content = $this->strip_attributes($content);
+        
+        // Remove empty elements
+        $content = preg_replace('/<(?!img|br|hr|input\b)([a-z]+)[^>]*>([\s]*)<\/\1>/is', '', $content);
+        
+        // Check paragraph count after processing
+        preg_match_all('/<p(?:\s+[^>]*)?>(.*?)<\/p>/is', $content, $processed_paragraphs);
+        $processed_p_count = count($processed_paragraphs[0]);
+        if ($processed_p_count > 0) {
+            error_log("MIGRATION: First paragraph after processing: " . substr(strip_tags($processed_paragraphs[0][0]), 0, 50) . "...");
+        }
+        error_log("MIGRATION: Number of paragraphs after processing: " . $processed_p_count);
+        
+        // If content is too short after processing or we lost paragraphs, restore the original but just remove H1s
+        if (strlen(trim(strip_tags($content))) < 200 || ($original_p_count > 0 && $processed_p_count < $original_p_count / 2)) {
+            error_log("MIGRATION WARNING: Content was too short or paragraphs were lost after processing. Original: " . 
+                $original_p_count . " paragraphs, Processed: " . $processed_p_count . " paragraphs. Using alternative processing.");
+                
+            // Try alternative processing with more careful cleaning
+            $content = preg_replace('/<h1(?:\s+[^>]*)?>(.*?)<\/h1>/is', '', $original_content);
+            
+            // Remove navigation, menu, sidebar, and header/footer elements
+            $content = preg_replace('/<nav\b[^>]*>.*?<\/nav>/is', '', $content);
+            $content = preg_replace('/<header\b[^>]*>.*?<\/header>/is', '', $content);
+            $content = preg_replace('/<footer\b[^>]*>.*?<\/footer>/is', '', $content);
+            $content = preg_replace('/<aside\b[^>]*>.*?<\/aside>/is', '', $content);
+            
+            // Remove menus and navigation by class/id
+            $content = preg_replace('/<[^>]*class=["\'][^"\']*\b(menu|navigation|navbar)\b[^"\']*["\'](.*?)>.*?<\/[^>]*>/is', '', $content);
+            $content = preg_replace('/<[^>]*id=["\'][^"\']*\b(menu|navigation|navbar)\b[^"\']*["\'](.*?)>.*?<\/[^>]*>/is', '', $content);
+            
+            // Just do minimal additional cleanup to avoid losing content
+            $content = preg_replace('/<script\b[^>]*>(.*?)<\/script>/is', '', $content);
+            $content = preg_replace('/<style\b[^>]*>(.*?)<\/style>/is', '', $content);
+            $content = preg_replace('/<!--(.*?)-->/s', '', $content);
+            $content = preg_replace('/<(?!img|br|hr|input\b)([a-z]+)[^>]*>([\s]*)<\/\1>/is', '', $content);
+        }
+        
+        // IMPORTANT: Do NOT add the H1 from Excel to the content for posts
+        // The post title will be used as the H1 by the theme
+        
+        // Final cleanup with wp_kses to ensure safe HTML
+        $allowed_html = array(
+            'p' => array(),
+            'span' => array(),
+            'br' => array(),
+            'strong' => array(),
+            'em' => array(),
+            'b' => array(),
+            'i' => array(),
+            'ul' => array(),
+            'ol' => array(),
+            'li' => array(),
+            'h2' => array(),
+            'h3' => array(),
+            'h4' => array(),
+            'h5' => array(),
+            'h6' => array(),
+            'blockquote' => array(),
+            'img' => array(
+                'src' => array(),
+                'alt' => array(),
+                'width' => array(),
+                'height' => array(),
+            ),
+            'a' => array(
+                'href' => array(),
+                'title' => array(),
+                'target' => array(),
+            ),
+            'div' => array(), // Allow divs to preserve more content
+            'table' => array(), // Allow tables
+            'tr' => array(),
+            'td' => array(),
+            'th' => array(),
+        );
+        
+        $final_content = wp_kses($content, $allowed_html);
+        
+        // Last check to ensure we have content
+        if (strlen(trim(strip_tags($final_content))) < 200) {
+            error_log("MIGRATION WARNING: Final content too short after wp_kses, extracting basic paragraphs");
+            
+            // Extract just the paragraphs from the original content
+            preg_match_all('/<p[^>]*>(.*?)<\/p>/is', $original_content, $all_paragraphs);
+            if (!empty($all_paragraphs[0]) && count($all_paragraphs[0]) > 0) {
+                $final_content = '<div>' . implode('', $all_paragraphs[0]) . '</div>';
+                $final_content = wp_kses($final_content, $allowed_html);
+            } else {
+                // Last resort - extract paragraph content manually
+                $final_content = '<p>' . strip_tags($original_content) . '</p>';
+            }
+        }
+        
+        // Final paragraph count
+        preg_match_all('/<p(?:\s+[^>]*)?>(.*?)<\/p>/is', $final_content, $final_paragraphs);
+        $final_p_count = count($final_paragraphs[0]);
+        error_log("MIGRATION: Final number of paragraphs: " . $final_p_count);
+        
+        $content_size = strlen($final_content);
+        $text_size = strlen(strip_tags($final_content));
+        error_log("MIGRATION: Finished processing post content - HTML Size: {$content_size} bytes, Text size: {$text_size} chars");
+        
+        return $final_content;
+    }
+    
+    /**
+     * Remove common title patterns from content
+     */
+    private function remove_common_title_patterns($content) {
+        // Title patterns that might appear at the start of content
+        $patterns = array(
+            // Typical title patterns - only match at the beginning of the content
+            '/^<p(?:\s+[^>]*)?>\s*<strong(?:\s+[^>]*)?>(.*?)<\/strong>\s*<\/p>/is',
+            '/^<p(?:\s+[^>]*)?>\s*<b(?:\s+[^>]*)?>(.*?)<\/b>\s*<\/p>/is',
+            '/^<p(?:\s+[^>]*)?>\s*<span(?:\s+[^>]*)?><strong(?:\s+[^>]*)?>(.*?)<\/strong><\/span>\s*<\/p>/is',
+            
+            // Common author signature patterns - only at the beginning or end
+            '/^<p(?:\s+[^>]*)?>\s*(?:By|Written by|Author:)?\s*(?:<[^>]+>)*\s*(?:Author|Attorney|Lawyer|Contributor|Staff\s+Writer|Law\s+Group|Law\s+Firm)(?:<\/[^>]+>)*[^<]*<\/p>/is',
+            '/^<p(?:\s+[^>]*)?>\s*(?:By|Written by|Author:)?\s*(?:<[^>]+>)*[A-Z][a-z]+\s+[A-Z][a-z]+(?:<\/[^>]+>)*[^<]*<\/p>/is', // Generic name pattern (FirstName LastName)
+            
+            // Date patterns at the start
+            '/^<p(?:\s+[^>]*)?>\s*(?:Posted on|Published on|Date:)?\s*(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\s*<\/p>/is',
+        );
+        
+        // Count paragraphs before removal
+        preg_match_all('/<p(?:\s+[^>]*)?>(.*?)<\/p>/is', $content, $before_paragraphs);
+        $before_count = count($before_paragraphs[0]);
+        
+        // Log first paragraph content before removal
+        if ($before_count > 0) {
+            $first_p = strip_tags($before_paragraphs[0][0]);
+            error_log("MIGRATION: First paragraph before pattern removal: " . substr($first_p, 0, 50) . "...");
+        }
+        
+        // Remove the first instance of each pattern only (typically at the start of content)
+        foreach ($patterns as $pattern) {
+            // Only apply the pattern if it matches at the beginning of the content
+            if (preg_match($pattern, $content)) {
+                $content = preg_replace($pattern, '', $content, 1);
+                error_log("MIGRATION: Removed title pattern: " . $pattern);
+            }
+        }
+        
+        // Count paragraphs after removal
+        preg_match_all('/<p(?:\s+[^>]*)?>(.*?)<\/p>/is', $content, $after_paragraphs);
+        $after_count = count($after_paragraphs[0]);
+        
+        // Log first paragraph content after removal
+        if ($after_count > 0) {
+            $first_p = strip_tags($after_paragraphs[0][0]);
+            error_log("MIGRATION: First paragraph after pattern removal: " . substr($first_p, 0, 50) . "...");
+        }
+        
+        error_log("MIGRATION: Paragraphs before/after title pattern removal: " . $before_count . "/" . $after_count);
+        
+        return $content;
+    }
+    
+    /**
+     * Extract publication date from HTML
+     * Tries multiple methods in priority order
+     */
+    private function extract_publication_date($html) {
+        // Set a default timezone if not set
+        if (function_exists('date_default_timezone_set') && function_exists('date_default_timezone_get')) {
+            $current_timezone = date_default_timezone_get();
+            date_default_timezone_set('UTC');
+        }
+        
+        $found_date = null;
+        
+        // Method 1: Check for article:published_time meta tag (most reliable)
+        if (preg_match('/<meta\s+property=["\']article:published_time["\']\s+content=["\'](.*?)["\']/i', $html, $matches)) {
+            $date = trim($matches[1]);
+            // Validate the date format
+            if ($this->is_valid_date($date)) {
+                $found_date = $date;
+            }
+        }
+        
+        // Method 2: Check for pubdate meta tag
+        if (!$found_date && preg_match('/<meta\s+name=["\']pubdate["\']\s+content=["\'](.*?)["\']/i', $html, $matches)) {
+            $date = trim($matches[1]);
+            if ($this->is_valid_date($date)) {
+                $found_date = $date;
+            }
+        }
+        
+        // Method 3: Check for time tag with datetime attribute
+        if (!$found_date && preg_match('/<time\s+datetime=["\']([^"\']+)["\'][^>]*>/i', $html, $matches)) {
+            $date = trim($matches[1]);
+            if ($this->is_valid_date($date)) {
+                $found_date = $date;
+            }
+        }
+        
+        // Method 4: Check for date class elements
+        if (!$found_date && preg_match('/<[a-z]+[^>]*class=["\'][^"\']*date[^"\']*["\'](.*?)>(.*?)<\/[a-z]+>/is', $html, $matches)) {
+            $date_text = trim(strip_tags($matches[2]));
+            if ($this->is_valid_date($date_text)) {
+                $found_date = $date_text;
+            }
+        }
+        
+        // Method 5: Look for schema.org date markup
+        if (!$found_date && preg_match('/<[a-z]+[^>]*itemprop=["\']datePublished["\'](.*?)>(.*?)<\/[a-z]+>/is', $html, $matches)) {
+            $date_text = trim(strip_tags($matches[2]));
+            if ($this->is_valid_date($date_text)) {
+                $found_date = $date_text;
+            }
+        }
+        
+        // Method 6: Look for published date in JSON-LD script
+        if (!$found_date && preg_match('/<script\s+type=["\']application\/ld\+json["\'](.*?)>(.*?)<\/script>/is', $html, $script_matches)) {
+            $json_content = $script_matches[2];
+            $json_data = json_decode($json_content, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                // Look for datePublished in JSON structure
+                if (isset($json_data['datePublished'])) {
+                    $date = trim($json_data['datePublished']);
+                    if ($this->is_valid_date($date)) {
+                        $found_date = $date;
+                    }
+                } elseif (isset($json_data['@graph']) && is_array($json_data['@graph'])) {
+                    // Look through graph array
+                    foreach ($json_data['@graph'] as $item) {
+                        if (isset($item['datePublished'])) {
+                            $date = trim($item['datePublished']);
+                            if ($this->is_valid_date($date)) {
+                                $found_date = $date;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Method 7: Extract from URL if it contains a date pattern
+        if (!$found_date && preg_match('#/(\d{4})/(\d{2})/(\d{2})/#', $html, $url_date_matches)) {
+            $year = $url_date_matches[1];
+            $month = $url_date_matches[2];
+            $day = $url_date_matches[3];
+            
+            // Validate the URL date (basic validation)
+            if ($year >= 2000 && $year <= date('Y') && $month >= 1 && $month <= 12 && $day >= 1 && $day <= 31) {
+                $found_date = "$year-$month-$day";
+            }
+        }
+        
+        // Format the date for WordPress
+        if ($found_date) {
+            $timestamp = strtotime($found_date);
+            $formatted_date = date('Y-m-d H:i:s', $timestamp);
+            
+            // Restore original timezone
+            if (isset($current_timezone)) {
+                date_default_timezone_set($current_timezone);
+            }
+            
+            return $formatted_date;
+        }
+        
+        // Fallback to current time
+        $current_time = current_time('mysql');
+        
+        // Restore original timezone
+        if (isset($current_timezone)) {
+            date_default_timezone_set($current_timezone);
+        }
+        
+        return $current_time;
+    }
+    
+    /**
+     * Validate a date string
+     */
+    private function is_valid_date($date) {
+        // Check if date is valid
+        if (empty($date)) return false;
+        
+        $d = DateTime::createFromFormat('Y-m-d H:i:s', $date);
+        return $d && $d->format('Y-m-d H:i:s') === $date;
+    }
+    
+    /**
+     * Determine post categories based on URL structure
+     */
+    private function determine_post_categories($url) {
+        $url = trim($url, '/');
+        $parts = explode('/', $url);
+        $category_ids = array();
+        
+        // The first segment is usually the primary category for blog posts
+        if (count($parts) > 0) {
+            $primary_cat_slug = $parts[0];
+            
+            // Default to 'blog' if not found or empty
+            if (empty($primary_cat_slug)) {
+                $primary_cat_slug = 'blog';
+            }
+            
+            $category_id = $this->get_or_create_category($primary_cat_slug);
+            if ($category_id) {
+                $category_ids[] = $category_id;
+                error_log("MIGRATION: Assigned post to category: {$primary_cat_slug} (ID: {$category_id})");
+            }
+            
+            // For deeper URLs, also add the second segment as a subcategory if applicable
+            if (count($parts) > 1) {
+                $subcategory_slug = $parts[1];
+                if (!empty($subcategory_slug)) {
+                    // Get or create the subcategory
+                    $cat_args = array(
+                        'slug' => $subcategory_slug,
+                        'parent' => $category_id
+                    );
+                    
+                    $existing_subcategory = get_term_by('slug', $subcategory_slug, 'category');
+                    if ($existing_subcategory) {
+                        $subcategory_id = $existing_subcategory->term_id;
+                    } else {
+                        $subcategory_name = ucwords(str_replace(array('-', '_'), ' ', $subcategory_slug));
+                        $insert_result = wp_insert_term($subcategory_name, 'category', $cat_args);
+                        $subcategory_id = is_wp_error($insert_result) ? 0 : $insert_result['term_id'];
+                    }
+                    
+                    if ($subcategory_id && $subcategory_id != $category_id) {
+                        $category_ids[] = $subcategory_id;
+                        error_log("MIGRATION: Also assigned to subcategory: {$subcategory_slug} (ID: {$subcategory_id})");
+                    }
+                }
+            }
+        } else {
+            // If no path segments, assign to default 'blog' category
+            $category_id = $this->get_or_create_category('blog');
+            if ($category_id) {
+                $category_ids[] = $category_id;
+                error_log("MIGRATION: Assigned post to default 'blog' category (ID: {$category_id})");
+            }
+        }
+        
+        return $category_ids;
+    }
+    
+    private function set_featured_image($post_id, $image_url) {
+        // Handle the case when the Image field is set to "Yes" to migrate image from old site
+        if (strtolower(trim($image_url)) === 'yes') {
+            // Get the post's old URL from meta
+            $old_url = get_post_meta($post_id, '_content_migrator_old_url', true);
+            
+            if (empty($old_url)) {
+                error_log("MIGRATION: No old URL found for post ID: $post_id, cannot fetch featured image");
+                return false;
+            }
+            
+            error_log("MIGRATION: Attempting to fetch featured image from old URL: $old_url for post ID: $post_id");
+            
+            // Fetch the page HTML to extract an image
+            $response = wp_remote_get($old_url, array(
+                'timeout' => 60,
+                'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36'
+            ));
+            
+            if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+                error_log("MIGRATION: Failed to fetch page from old URL: $old_url - " . 
+                    (is_wp_error($response) ? $response->get_error_message() : 'HTTP Status: ' . wp_remote_retrieve_response_code($response)));
+                return false;
+            }
+            
+            $html = wp_remote_retrieve_body($response);
+            
+            // Try to find featured image in Open Graph meta tags first (highest quality for social sharing)
+            if (preg_match('/<meta\s+property=["|\']og:image["|\'][^>]+content=["|\']([^"\']+)["|\']/i', $html, $matches)) {
+                $image_url = $matches[1];
+                error_log("MIGRATION: Found featured image in Open Graph meta: $image_url");
+            } 
+            // Then try Twitter card image
+            elseif (preg_match('/<meta\s+name=["|\']twitter:image["|\'][^>]+content=["|\']([^"\']+)["|\']/i', $html, $matches)) {
+                $image_url = $matches[1];
+                error_log("MIGRATION: Found featured image in Twitter card meta: $image_url");
+            }
+            // Look for schema.org image
+            elseif (preg_match('/<script\s+type=["|\'](application\/ld\+json|application\/json)["|\'](.*?)>(.*?)<\/script>/is', $html, $script_matches)) {
+                $json_content = $script_matches[3];
+                $json_data = json_decode($json_content, true);
+                if (json_last_error() === JSON_ERROR_NONE && isset($json_data['image'])) {
+                    if (is_array($json_data['image']) && isset($json_data['image']['url'])) {
+                        $image_url = $json_data['image']['url'];
+                    } elseif (is_string($json_data['image'])) {
+                        $image_url = $json_data['image'];
+                    }
+                    if (!empty($image_url)) {
+                        error_log("MIGRATION: Found featured image in schema.org JSON-LD: $image_url");
+                    }
+                }
+            }
+            // Finally, look for the first large image in content
+            else {
+                // Extract potential featured images (large images in the content)
+                preg_match_all('/<img[^>]+src=["|\']([^"\']+)["|\']/i', $html, $img_matches);
+                
+                if (!empty($img_matches[1])) {
+                    $largest_img = '';
+                    $largest_size = 0;
+                    
+                    // Try to find the largest image by dimensions in src attribute
+                    foreach ($img_matches[1] as $img) {
+                        // Skip small icons, avatars, etc.
+                        if (strpos($img, 'icon') !== false || strpos($img, 'avatar') !== false || 
+                            strpos($img, 'logo') !== false || strpos($img, 'spinner') !== false) {
+                            continue;
+                        }
+                        
+                        // Check for dimension indicators in filename or URL
+                        if (preg_match('/\-(\d+)x(\d+)\./i', $img, $dim_matches)) {
+                            $size = intval($dim_matches[1]) * intval($dim_matches[2]);
+                            if ($size > $largest_size) {
+                                $largest_size = $size;
+                                $largest_img = $img;
+                            }
+                        } else {
+                            // If no dimensions in filename, prioritize by position (first image often most important)
+                            if (empty($largest_img)) {
+                                $largest_img = $img;
+                            }
+                        }
+                    }
+                    
+                    if (!empty($largest_img)) {
+                        // Convert relative URLs to absolute
+                        if (substr($largest_img, 0, 4) !== 'http') {
+                            $parsed_url = parse_url($old_url);
+                            $base_url = $parsed_url['scheme'] . '://' . $parsed_url['host'];
+                            
+                            if (substr($largest_img, 0, 1) === '/') {
+                                $largest_img = $base_url . $largest_img;
+                            } else {
+                                // Handle relative paths
+                                $path = isset($parsed_url['path']) ? $parsed_url['path'] : '';
+                                $path = substr($path, 0, strrpos($path, '/') + 1);
+                                $largest_img = $base_url . $path . $largest_img;
+                            }
+                        }
+                        
+                        $image_url = $largest_img;
+                        error_log("MIGRATION: Found potential featured image in content: $image_url");
+                    }
+                }
+            }
+        }
+        
+        // Don't proceed if the URL is empty
+        if (empty($image_url)) {
+            error_log("MIGRATION: Could not find a valid image URL for post ID: $post_id");
+            return false;
+        }
+        
+        // Check if URL is valid
+        if (!filter_var($image_url, FILTER_VALIDATE_URL)) {
+            error_log("MIGRATION: Invalid image URL provided: $image_url for post ID: $post_id");
+            return false;
+        }
+        
+        // Get the file name from the URL
+        $filename = basename(parse_url($image_url, PHP_URL_PATH));
+        
+        // Download the image using WordPress HTTP API
+        $response = wp_remote_get($image_url, array(
+            'timeout' => 60,
+            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36'
+        ));
+        
+        // Check for errors
+        if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+            error_log("MIGRATION: Failed to download image from URL: $image_url - " . (is_wp_error($response) ? $response->get_error_message() : 'HTTP Status: ' . wp_remote_retrieve_response_code($response)));
+            return false;
+        }
+        
+        // Get image data
+        $image_data = wp_remote_retrieve_body($response);
+        
+        // Upload and attach the image
+        $upload = wp_upload_bits($filename, null, $image_data);
+        
+        if ($upload['error']) {
+            error_log("MIGRATION: Error uploading image: " . $upload['error']);
+            return false;
+        }
+        
+        // Check the file type
+        $wp_filetype = wp_check_filetype($filename, null);
+        
+        // Create a title for the image based on post title
+        $post = get_post($post_id);
+        $image_title = sanitize_text_field($post->post_title) . ' Featured Image';
+        
+        // Create alt text from post title
+        $image_alt = sanitize_text_field($post->post_title);
+        
+        // Prepare attachment data
+        $attachment = array(
+            'post_mime_type' => $wp_filetype['type'],
+            'post_title' => $image_title,
+            'post_content' => '',
+            'post_excerpt' => $image_title,  // Set the caption
+            'post_status' => 'inherit'
+        );
+        
+        // Insert attachment
+        $attachment_id = wp_insert_attachment($attachment, $upload['file'], $post_id);
+        
+        if (is_wp_error($attachment_id)) {
+            error_log("MIGRATION: Error creating attachment: " . $attachment_id->get_error_message());
+            return false;
+        }
+        
+        // Generate attachment metadata
+        if (!function_exists('wp_generate_attachment_metadata')) {
+            require_once(ABSPATH . 'wp-admin/includes/image.php');
+        }
+        
+        // Generate metadata for the attachment and update the database record
+        $attachment_data = wp_generate_attachment_metadata($attachment_id, $upload['file']);
+        wp_update_attachment_metadata($attachment_id, $attachment_data);
+        
+        // Set the alt text
+        update_post_meta($attachment_id, '_wp_attachment_image_alt', $image_alt);
+        
+        // Set as featured image
+        $result = set_post_thumbnail($post_id, $attachment_id);
+        
+        if ($result) {
+            error_log("MIGRATION: Successfully set featured image for post ID: $post_id with image ID: $attachment_id");
+            return true;
+        } else {
+            error_log("MIGRATION: Failed to set featured image for post ID: $post_id");
+            return false;
+        }
+    }
+
+    /**
+     * Process images in content, downloading and replacing URLs
+     * 
+     * @param string $content The HTML content with images
+     * @param int $post_id The post ID to attach images to
+     * @param string $old_site_url The base URL of the old site
+     * @return string Updated content with local image URLs
+     */
+    private function process_content_images($content, $post_id, $old_site_url) {
+        if (empty($content)) {
+            return $content;
+        }
+        
+        // Track already processed images to avoid duplicates
+        static $processed_images = array();
+        if (!isset($processed_images[$post_id])) {
+            $processed_images[$post_id] = array();
+        }
+        
+        // Cache of URLs we've already mapped for this post
+        static $url_cache = array();
+        if (!isset($url_cache[$post_id])) {
+            $url_cache[$post_id] = array();
+        }
+        
+        // Extract all image tags from the content
+        preg_match_all('/<img[^>]+src=["|\']([^"\']+)["|\'][^>]*>/i', $content, $matches);
+        
+        if (empty($matches[0])) {
+            return $content; // No images found
+        }
+        
+        error_log("MIGRATION: Found " . count($matches[0]) . " images in content for post: " . $post_id);
+        
+        $img_tags = $matches[0];
+        $img_urls = $matches[1];
+        $new_content = $content;
+        
+        // Process each image
+        foreach ($img_tags as $i => $img_tag) {
+            $old_url = $img_urls[$i];
+            
+            // Skip data URIs
+            if (strpos($old_url, 'data:') === 0) {
+                error_log("MIGRATION: Skipping data URI image");
+                continue;
+            }
+            
+            // Check if we've already processed this exact URL for this post
+            if (isset($url_cache[$post_id][$old_url])) {
+                $new_img_tag = str_replace($old_url, $url_cache[$post_id][$old_url], $img_tag);
+                $new_content = str_replace($img_tag, $new_img_tag, $new_content);
+                error_log("MIGRATION: Using cached URL mapping for: " . $old_url);
+                continue;
+            }
+            
+            // Extract image filename for comparison
+            $filename = basename(parse_url($old_url, PHP_URL_PATH));
+            $filename = strtok($filename, '?'); // Remove query parameters
+            $filename_base = pathinfo($filename, PATHINFO_FILENAME);
+            
+            // Skip if we've already processed this image for this post (based on filename)
+            if (in_array($filename_base, $processed_images[$post_id])) {
+                error_log("MIGRATION: Skipping already processed image: " . $filename_base);
+                continue;
+            }
+            
+            // Convert relative URLs to absolute
+            $absolute_url = $old_url;
+            if (strpos($old_url, '/') === 0 && strpos($old_url, '//') !== 0) {
+                // Relative URL starting with single slash
+                $absolute_url = rtrim($old_site_url, '/') . $old_url;
+                error_log("MIGRATION: Converted relative URL: " . $old_url . " to absolute: " . $absolute_url);
+            } elseif (strpos($old_url, 'http') !== 0) {
+                // Other relative URL (no leading slash)
+                $absolute_url = rtrim($old_site_url, '/') . '/' . ltrim($old_url, '/');
+                error_log("MIGRATION: Converted relative URL: " . $old_url . " to absolute: " . $absolute_url);
+            }
+            
+            // Validate URL
+            if (!filter_var($absolute_url, FILTER_VALIDATE_URL)) {
+                error_log("MIGRATION ERROR: Invalid image URL: " . $absolute_url);
+                continue;
+            }
+            
+            // Download and upload the image
+            $attachment_id = $this->download_and_upload_image($absolute_url, $post_id);
+            
+            if ($attachment_id) {
+                // Get the new URL
+                $new_url = wp_get_attachment_url($attachment_id);
+                
+                if ($new_url) {
+                    // Replace the URL in the img tag
+                    $new_img_tag = str_replace($old_url, $new_url, $img_tag);
+                    
+                    // Also update the srcset attribute if it exists
+                    if (strpos($new_img_tag, 'srcset=') !== false) {
+                        $new_img_tag = preg_replace_callback(
+                            '/srcset=["|\']([^"\']+)["|\']/',
+                            function($srcset_match) use ($old_url, $new_url) {
+                                // Replace all instances of the old URL in the srcset
+                                $new_srcset = str_replace($old_url, $new_url, $srcset_match[1]);
+                                return 'srcset="' . $new_srcset . '"';
+                            },
+                            $new_img_tag
+                        );
+                    }
+                    
+                    // Also update any base64 data-src attributes
+                    if (strpos($new_img_tag, 'data-src=') !== false && strpos($new_img_tag, 'data:image') !== false) {
+                        $new_img_tag = preg_replace(
+                            '/data-src=["|\']data:image[^"\']+["|\']/',
+                            'data-src="' . $new_url . '"',
+                            $new_img_tag
+                        );
+                    }
+                    
+                    // Check if the image has alt text, add if missing
+                    if (strpos($new_img_tag, 'alt=') === false) {
+                        // Get alt text from attachment or post title
+                        $alt_text = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
+                        if (empty($alt_text)) {
+                            $post = get_post($post_id);
+                            $alt_text = $post ? $post->post_title : '';
+                        }
+                        
+                        // Add alt attribute
+                        $new_img_tag = str_replace('<img ', '<img alt="' . esc_attr($alt_text) . '" ', $new_img_tag);
+                    }
+                    
+                    // Update the content
+                    $new_content = str_replace($img_tag, $new_img_tag, $new_content);
+                    
+                    // Store this URL in the cache
+                    $url_cache[$post_id][$old_url] = $new_url;
+                    
+                    // Mark as processed
+                    $processed_images[$post_id][] = $filename_base;
+                    
+                    error_log("MIGRATION: Updated image URL from " . $old_url . " to " . $new_url);
+                }
+            }
+        }
+        
+        return $new_content;
+    }
+    
+    /**
+     * Downloads and uploads an image from a URL and attaches it to a post.
+     */
+    private function download_and_upload_image($image_url, $post_id) {
+        // Validate URL before proceeding
+        if (empty($image_url) || !filter_var($image_url, FILTER_VALIDATE_URL)) {
+            error_log("MIGRATION ERROR: Invalid image URL: " . $image_url);
+            return 0;
+        }
+        
+        // Extract filename from URL for comparison
+        $filename = basename(parse_url($image_url, PHP_URL_PATH));
+        $filename = strtok($filename, '?'); // Remove query parameters
+        $filename_base = pathinfo($filename, PATHINFO_FILENAME);
+        $clean_filename_base = preg_replace('/[^a-zA-Z0-9]/', '', strtolower($filename_base));
+        $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+        
+        error_log("MIGRATION: Processing image: " . $filename_base . " for post: " . $post_id);
+        
+        // 1. Check if this exact image was already uploaded to this post
+        // Use WP database to check for attachments with this post as parent
+        global $wpdb;
+        $existing_attachment = $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT ID FROM {$wpdb->posts} 
+                WHERE post_type = 'attachment' 
+                AND post_parent = %d
+                AND (
+                    guid LIKE %s
+                    OR guid LIKE %s
+                    OR guid LIKE %s
+                )",
+                $post_id,
+                '%/' . $wpdb->esc_like($filename_base) . '.jpg',
+                '%/' . $wpdb->esc_like($filename_base) . '.jpeg',
+                '%/' . $wpdb->esc_like($filename_base) . '.png'
+            )
+        );
+        
+        if ($existing_attachment) {
+            error_log("MIGRATION: Image already uploaded to this post: " . $filename_base);
+            return $existing_attachment->ID;
+        }
+        
+        // 2. Check for any attachment with this exact URL
+        $attachment_by_url = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT ID FROM {$wpdb->posts} 
+                WHERE post_type = 'attachment' 
+                AND guid = %s",
+                $image_url
+            )
+        );
+        
+        if ($attachment_by_url) {
+            error_log("MIGRATION: Found existing image by exact URL: " . $image_url);
+            $this->attach_image_to_post($attachment_by_url, $post_id);
+            return $attachment_by_url;
+        }
+        
+        // 3. Check the media library for WordPress-generated variants of this filename
+        // First check for the original filename
+        $existing_id = $this->find_existing_attachment_by_filename($filename_base);
+        if ($existing_id) {
+            error_log("MIGRATION: Found existing image by filename: " . $filename_base);
+            $this->attach_image_to_post($existing_id, $post_id);
+            return $existing_id;
+        }
+        
+        // 4. Check if we have a file match with a numerical suffix added by WordPress (-1, -2, etc.)
+        $base_without_suffix = preg_replace('/-\d+$/', '', $filename_base);
+        $has_suffix = ($base_without_suffix !== $filename_base);
+        
+        if ($has_suffix) {
+            // If our filename already has a suffix, check for the original
+            $without_suffix_id = $this->find_existing_attachment_by_filename($base_without_suffix);
+            if ($without_suffix_id) {
+                error_log("MIGRATION: Found existing image by removing suffix: " . $base_without_suffix);
+                $this->attach_image_to_post($without_suffix_id, $post_id);
+                return $without_suffix_id;
+            }
+        } else {
+            // If our filename doesn't have a suffix, check for variants with suffixes
+            $with_suffix_pattern = $filename_base . '-';
+            $possible_attachments = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT ID, guid FROM {$wpdb->posts} 
+                    WHERE post_type = 'attachment' 
+                    AND (post_mime_type LIKE %s OR post_mime_type LIKE %s)
+                    AND guid LIKE %s",
+                    'image/jpeg',
+                    'image/png',
+                    '%/' . $wpdb->esc_like($with_suffix_pattern) . '%'
+                )
+            );
+            
+            if (!empty($possible_attachments)) {
+                // Take the first match - it's a variant of our image
+                error_log("MIGRATION: Found existing image with suffix added by WordPress: " . $possible_attachments[0]->guid);
+                $this->attach_image_to_post($possible_attachments[0]->ID, $post_id);
+                return $possible_attachments[0]->ID;
+            }
+        }
+        
+        // 5. Advanced check - look for sanitized filename matches across all media
+        $all_attachments = $wpdb->get_results(
+            "SELECT ID, guid, post_title FROM {$wpdb->posts} 
+            WHERE post_type = 'attachment' 
+            AND (post_mime_type LIKE 'image/jpeg' OR post_mime_type LIKE 'image/png' OR post_mime_type LIKE 'image/gif')"
+        );
+        
+        foreach ($all_attachments as $attachment) {
+            $att_filename = basename(parse_url($attachment->guid, PHP_URL_PATH));
+            $att_filename = strtok($att_filename, '?'); // Remove query parameters
+            $att_base = pathinfo($att_filename, PATHINFO_FILENAME);
+            
+            // Check for numbered suffixes WordPress adds
+            if (preg_match('/(.*)-\d+$/', $att_base, $matches)) {
+                $att_base_without_suffix = $matches[1];
+                
+                // If base matches our filename or base without suffix
+                if (strcasecmp($att_base_without_suffix, $filename_base) === 0 || 
+                    strcasecmp($att_base_without_suffix, $base_without_suffix) === 0) {
+                    error_log("MIGRATION: Found existing image with WordPress-generated suffix: " . $att_base);
+                    $this->attach_image_to_post($attachment->ID, $post_id);
+                    return $attachment->ID;
+                }
+            }
+            
+            // Clean filenames for comparison
+            $clean_att_base = preg_replace('/[^a-zA-Z0-9]/', '', strtolower($att_base));
+            
+            // Remove dimensions that might be added to the filename (like image-300x200)
+            $clean_att_base = preg_replace('/-\d+x\d+$/', '', $clean_att_base);
+            $clean_comparison_base = preg_replace('/-\d+x\d+$/', '', $clean_filename_base);
+            
+            // Check for match
+            if ($clean_att_base === $clean_comparison_base || 
+                strpos($clean_att_base, $clean_comparison_base) === 0 || 
+                strpos($clean_comparison_base, $clean_att_base) === 0) {
+                error_log("MIGRATION: Found existing image by sanitized filename: " . $att_base . " matches " . $filename_base);
+                $this->attach_image_to_post($attachment->ID, $post_id);
+                return $attachment->ID;
+            }
+            
+            // Check post title for match
+            $clean_title = preg_replace('/[^a-zA-Z0-9]/', '', strtolower($attachment->post_title));
+            if ($clean_title === $clean_comparison_base || 
+                strpos($clean_title, $clean_comparison_base) === 0 || 
+                strpos($clean_comparison_base, $clean_title) === 0) {
+                error_log("MIGRATION: Found existing image by post title: " . $attachment->post_title . " matches " . $filename_base);
+                $this->attach_image_to_post($attachment->ID, $post_id);
+                return $attachment->ID;
+            }
+        }
+        
+        // Now download the image for further processing
+        error_log("MIGRATION: No existing match found, downloading image: " . $image_url);
+        $tmp_file = download_url($image_url);
+        if (is_wp_error($tmp_file)) {
+            error_log("MIGRATION ERROR: Failed to download image: " . $image_url . " - " . $tmp_file->get_error_message());
+            return 0;
+        }
+        
+        // 6. Check for visual duplication - compare image content
+        $duplicate_id = $this->find_duplicate_image_by_content($tmp_file);
+        if ($duplicate_id) {
+            // Use the existing image instead of uploading a new one
+            @unlink($tmp_file); // Delete temp file
+            error_log("MIGRATION: Found existing image by content match: " . $duplicate_id);
+            $this->attach_image_to_post($duplicate_id, $post_id);
+            return $duplicate_id;
+        }
+        
+        // Get a unique filename to ensure WordPress doesn't add a suffix
+        // This helps with future duplicate detection
+        $filename_no_ext = $filename_base;
+        // Remove any existing numeric suffixes
+        $filename_no_ext = preg_replace('/-\d+$/', '', $filename_no_ext);
+        // Generate a truly unique filename with a random string instead of a number
+        $unique_id = substr(md5(uniqid(mt_rand(), true)), 0, 8);
+        $unique_filename = $filename_no_ext . '-' . $unique_id . '.' . $extension;
+        
+        // Prepare file data for uploading
+        $file_array = array(
+            'name' => $unique_filename,
+            'tmp_name' => $tmp_file
+        );
+        
+        // Check file type
+        $filetype = wp_check_filetype($filename);
+        if (!$filetype['type'] || !in_array($filetype['type'], array('image/jpeg', 'image/png', 'image/gif'))) {
+            @unlink($tmp_file);
+            error_log("MIGRATION ERROR: Invalid image file type: " . $filetype['type']);
+            return 0;
+        }
+        
+        // Upload the image file to the media library
+        $attachment_id = media_handle_sideload($file_array, $post_id);
+        
+        // Check for errors
+        if (is_wp_error($attachment_id)) {
+            @unlink($tmp_file);
+            error_log("MIGRATION ERROR: Failed to upload image: " . $attachment_id->get_error_message());
+            return 0;
+        }
+        
+        // Clean up the temporary file
+        @unlink($tmp_file);
+        
+        // Update attachment metadata
+        $attachment_data = wp_generate_attachment_metadata($attachment_id, get_attached_file($attachment_id));
+        wp_update_attachment_metadata($attachment_id, $attachment_data);
+        
+        // Store the original filename in attachment meta to aid future lookups
+        update_post_meta($attachment_id, '_original_filename', $filename_base);
+        
+        error_log("MIGRATION: Successfully uploaded new image and attached to post: " . $post_id);
+        
+        return $attachment_id;
+    }
+    
+    /**
+     * Helper function to attach an image to a post and set as featured if needed
+     */
+    private function attach_image_to_post($attachment_id, $post_id) {
+        // Check if already attached
+        if ($this->is_image_attached_to_post($attachment_id, $post_id)) {
+            error_log("MIGRATION: Image already attached to post: " . $post_id);
+            return true;
+        }
+        
+        // Update post thumbnail if needed
+        if (!has_post_thumbnail($post_id)) {
+            set_post_thumbnail($post_id, $attachment_id);
+            error_log("MIGRATION: Set existing image as featured image: " . $attachment_id);
+        }
+        
+        // Update attachment parent if needed
+        $attachment = get_post($attachment_id);
+        if ($attachment && $attachment->post_parent != $post_id) {
+            // Only update if this attachment doesn't already have a parent
+            if ($attachment->post_parent == 0) {
+                wp_update_post(array(
+                    'ID' => $attachment_id,
+                    'post_parent' => $post_id
+                ));
+                error_log("MIGRATION: Updated attachment parent: " . $attachment_id . " to post: " . $post_id);
+            }
+        }
+        
+        return true;
+    }
+    
+    /**
+     * Finds existing attachment by filename base (without extension)
+     */
+    private function find_existing_attachment_by_filename($filename_base) {
+        global $wpdb;
+        
+        // Clean up the filename base for comparison
+        $clean_filename_base = preg_replace('/[^a-zA-Z0-9]/', '', strtolower($filename_base));
+        
+        // Also check for filenames with numerical suffixes (e.g., image-2.jpg)
+        $base_without_suffix = preg_replace('/-\d+$/', '', $filename_base);
+        $clean_base_without_suffix = preg_replace('/[^a-zA-Z0-9]/', '', strtolower($base_without_suffix));
+        
+        error_log("MIGRATION: Looking for existing image with base filename: " . $filename_base . " or " . $base_without_suffix);
+        
+        // First try to find exact filename match
+        $attachments = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT ID, post_title, guid FROM {$wpdb->posts} 
+                WHERE post_type = 'attachment' 
+                AND (post_mime_type LIKE %s OR post_mime_type LIKE %s)
+                AND (
+                    guid LIKE %s 
+                    OR guid LIKE %s 
+                    OR guid LIKE %s
+                    OR post_title = %s
+                    OR guid LIKE %s
+                    OR guid LIKE %s
+                    OR guid LIKE %s
+                    OR post_title LIKE %s
+                )",
+                'image/jpeg',
+                'image/png',
+                '%/' . $wpdb->esc_like($filename_base) . '.jpg',
+                '%/' . $wpdb->esc_like($filename_base) . '.jpeg',
+                '%/' . $wpdb->esc_like($filename_base) . '.png',
+                $filename_base,
+                '%/' . $wpdb->esc_like($base_without_suffix) . '-%.jpg',    // Match numeric suffixes
+                '%/' . $wpdb->esc_like($base_without_suffix) . '-%.jpeg',
+                '%/' . $wpdb->esc_like($base_without_suffix) . '-%.png',
+                $wpdb->esc_like($base_without_suffix) . '-%'                // Match in title
+            )
+        );
+        
+        if (!empty($attachments)) {
+            error_log("MIGRATION: Found exact attachment match for: " . $filename_base);
+            return $attachments[0]->ID;
+        }
+        
+        // If no exact match, try fuzzy match based on cleaned filename
+        $attachments = $wpdb->get_results(
+            "SELECT ID, post_title, guid FROM {$wpdb->posts} 
+            WHERE post_type = 'attachment' 
+            AND (post_mime_type LIKE 'image/jpeg' OR post_mime_type LIKE 'image/png')"
+        );
+        
+        // Iterate through attachments to find closest match
+        foreach ($attachments as $attachment) {
+            $attachment_filename = basename(parse_url($attachment->guid, PHP_URL_PATH));
+            $attachment_base = pathinfo($attachment_filename, PATHINFO_FILENAME);
+            
+            // Check for numbered suffixes
+            if (preg_match('/(.*)-\d+$/', $attachment_base, $matches)) {
+                $attachment_base_without_suffix = $matches[1];
+                
+                // If the base names match (ignoring the -2, -3, etc. suffix)
+                if (strcasecmp($attachment_base_without_suffix, $filename_base) === 0 || 
+                    strcasecmp($attachment_base_without_suffix, $base_without_suffix) === 0) {
+                    error_log("MIGRATION: Found existing image with numbered suffix: " . $attachment_base . " matches " . $filename_base);
+                    return $attachment->ID;
+                }
+            }
+            
+            $clean_attachment_base = preg_replace('/[^a-zA-Z0-9]/', '', strtolower($attachment_base));
+            
+            // Check for fuzzy match (filename without special chars)
+            similar_text($clean_filename_base, $clean_attachment_base, $percent);
+            if ($percent > 90) {
+                error_log("MIGRATION: Found fuzzy attachment match for: " . $filename_base . " (similarity: {$percent}%)");
+                return $attachment->ID;
+            }
+            
+            // Also check against base without suffix
+            similar_text($clean_base_without_suffix, $clean_attachment_base, $percent);
+            if ($percent > 90) {
+                error_log("MIGRATION: Found fuzzy attachment match for base name: " . $base_without_suffix . " (similarity: {$percent}%)");
+                return $attachment->ID;
+            }
+            
+            // Check if the actual filename appears in the guid at all
+            if (stripos($attachment->guid, $filename_base) !== false) {
+                error_log("MIGRATION: Found partial name match in URL for: " . $filename_base);
+                return $attachment->ID;
+            }
+            
+            // Also check post title for match
+            similar_text(strtolower($filename_base), strtolower($attachment->post_title), $title_percent);
+            if ($title_percent > 85) {
+                error_log("MIGRATION: Found title match for: " . $filename_base . " (similarity: {$title_percent}%)");
+                return $attachment->ID;
+            }
+        }
+        
+        return 0;
+    }
+    
+    /**
+     * Checks if an image is already attached to a post
+     *
+     * @param int $attachment_id The attachment ID
+     * @param int $post_id The post ID
+     * @return bool True if attached, false otherwise
+     */
+    private function is_image_attached_to_post($attachment_id, $post_id) {
+        $attachment = get_post($attachment_id);
+        
+        if (!$attachment) {
+            return false;
+        }
+        
+        // Check if directly attached to post
+        if ($attachment->post_parent == $post_id) {
+            return true;
+        }
+        
+        // Check if set as featured image
+        $thumbnail_id = get_post_thumbnail_id($post_id);
+        if ($thumbnail_id == $attachment_id) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Process internal links in content, replacing old URLs with new ones
+     * 
+     * @param string $content The HTML content with links
+     * @param string $old_site_url The base URL of the old site
+     * @param array $url_mappings Array of old URLs => new URLs
+     * @return string Updated content with replaced links
+     */
+    private function process_internal_links($content, $old_site_url, $url_mappings) {
+        if (empty($content) || empty($old_site_url)) {
+            return $content;
+        }
+        
+        // Extract domain from old site URL
+        $parsed_old_url = parse_url($old_site_url);
+        $old_domain = isset($parsed_old_url['host']) ? $parsed_old_url['host'] : '';
+        $old_scheme = isset($parsed_old_url['scheme']) ? $parsed_old_url['scheme'] : 'http';
+        
+        if (empty($old_domain)) {
+            return $content;
+        }
+        
+        // Create alternate versions of the domain to match
+        $old_domain_variations = [
+            $old_domain,
+            'www.' . $old_domain,
+            str_replace('www.', '', $old_domain)
+        ];
+        
+        // Prepare full domain with scheme for matching
+        $old_domain_full = $old_scheme . '://' . $old_domain;
+        $old_domain_full_www = $old_scheme . '://www.' . str_replace('www.', '', $old_domain);
+        
+        // Extract all links
+        preg_match_all('/<a[^>]+href=["|\']([^"\']+)["|\'][^>]*>/i', $content, $matches);
+        
+        if (empty($matches[0])) {
+            return $content; // No links found
+        }
+        
+        $link_tags = $matches[0];
+        $link_urls = $matches[1];
+        $site_url = site_url();
+        
+        // Prepare lookup dictionary for faster search
+        $url_lookup = [];
+        foreach ($url_mappings as $old => $new) {
+            // Strip scheme and domain to get just the path
+            $old_parsed = parse_url($old);
+            $old_path = isset($old_parsed['path']) ? trim($old_parsed['path'], '/') : '';
+            
+            // Store both with and without trailing slash
+            if (!empty($old_path)) {
+                $url_lookup[$old_path] = $new;
+                $url_lookup[$old_path . '/'] = $new;
+                // Also store the full URLs for direct matching
+                $url_lookup[$old] = $new;
+                
+                // Add variations with different domain formats
+                foreach ($old_domain_variations as $domain_var) {
+                    if (isset($old_parsed['scheme'])) {
+                        $url_lookup[$old_parsed['scheme'] . '://' . $domain_var . '/' . $old_path] = $new;
+        } else {
+                        $url_lookup['http://' . $domain_var . '/' . $old_path] = $new;
+                        $url_lookup['https://' . $domain_var . '/' . $old_path] = $new;
+                    }
+                }
+            }
+        }
+        
+        $links_replaced = 0;
+        foreach ($link_urls as $index => $link_url) {
+            $link_tag = $link_tags[$index];
+            $original_url = $link_url;
+            
+            // Skip mailto, tel, anchor and javascript links
+            if (strpos($link_url, 'mailto:') === 0 || 
+                strpos($link_url, 'tel:') === 0 || 
+                strpos($link_url, '#') === 0 ||
+                strpos($link_url, 'javascript:') === 0 ||
+                strpos($link_url, 'data:') === 0) {
+                continue;
+            }
+            
+            // Skip links that already point to the new site
+            if (strpos($link_url, $site_url) === 0) {
+                continue;
+            }
+            
+            // Check if this is an internal link to the old site
+            $is_internal = false;
+            $found_domain = '';
+            
+            // Check against all domain variations
+            foreach ($old_domain_variations as $domain_var) {
+                if (strpos($link_url, $domain_var) !== false) {
+                    $is_internal = true;
+                    $found_domain = $domain_var;
+                    break;
+                }
+            }
+            
+            // Also check for scheme+domain
+            if (!$is_internal) {
+                if (strpos($link_url, $old_domain_full) === 0 || 
+                    strpos($link_url, $old_domain_full_www) === 0) {
+                    $is_internal = true;
+                }
+            }
+            
+            // Relative URL (starts with / but not //)
+            if (!$is_internal && strpos($link_url, '/') === 0 && strpos($link_url, '//') !== 0) {
+                $is_internal = true;
+            }
+            
+            if ($is_internal) {
+                $new_url = '';
+                
+                // Extract the path component from the URL
+                $path = '';
+                if (strpos($link_url, 'http') === 0) {
+                    // Absolute URL - extract path
+                    $parsed_link = parse_url($link_url);
+                    $path = isset($parsed_link['path']) ? $parsed_link['path'] : '';
+                    $path = trim($path, '/');
+                } else {
+                    // Relative URL
+                    $path = trim($link_url, '/');
+                }
+                
+                // Step 1: Try direct lookup in our dictionary
+                if (isset($url_lookup[$link_url])) {
+                    $new_url = '/' . ltrim($url_lookup[$link_url], '/');
+                    error_log("MIGRATION: Found direct match for URL: " . $link_url . " -> " . $new_url);
+                }
+                // Step 2: Try just the path
+                else if (!empty($path) && isset($url_lookup[$path])) {
+                    $new_url = '/' . ltrim($url_lookup[$path], '/');
+                    error_log("MIGRATION: Found path match for URL: " . $link_url . " -> " . $new_url);
+                }
+                // Step 3: Try additional combinations
+                else {
+                    // Try with full URL variations
+                    foreach ($old_domain_variations as $domain_var) {
+                        $test_url = $old_scheme . '://' . $domain_var . '/' . $path;
+                        if (isset($url_lookup[$test_url])) {
+                            $new_url = '/' . ltrim($url_lookup[$test_url], '/');
+                            error_log("MIGRATION: Found variation match for URL: " . $link_url . " -> " . $new_url);
+                            break;
+                        }
+                    }
+                }
+                
+                // If no match found, redirect to homepage
+                if (empty($new_url)) {
+                    $new_url = '/';
+                    error_log("MIGRATION: No match found for URL, redirecting to homepage: " . $link_url);
+                }
+                
+                // Replace the old URL with the new one
+                if (!empty($new_url)) {
+                    $new_link_tag = str_replace($original_url, $new_url, $link_tag);
+                    $content = str_replace($link_tag, $new_link_tag, $content);
+                    $links_replaced++;
+                    error_log("MIGRATION: Updated internal link from $original_url to $new_url");
+                }
+            }
+        }
+        
+        error_log("MIGRATION: Replaced $links_replaced internal links in content");
+        return $content;
+    }
+
+    /**
+     * Extract the first image from content and use it as featured image
+     * 
+     * @param string $content The HTML content
+     * @param int $post_id The post ID
+     * @return array [updated_content, featured_image_url]
+     */
+    private function extract_first_image_as_featured($content, $post_id) {
+        $updated_content = $content;
+        $featured_image_url = '';
+        
+        // Extract all image tags
+        preg_match_all('/<img[^>]+src=["|\']([^"\']+)["|\'][^>]*>/i', $content, $matches);
+        
+        // If no images found, return original content
+        if (empty($matches[0]) || empty($matches[1])) {
+            return array('content' => $content, 'image_url' => '');
+        }
+        
+        // Get the first image
+        $first_img_tag = $matches[0][0];
+        $first_img_url = $matches[1][0];
+        
+        // Skip if URL is invalid
+        if (!filter_var($first_img_url, FILTER_VALIDATE_URL) && strpos($first_img_url, 'data:') !== 0 && strpos($first_img_url, '/') !== 0) {
+            error_log("MIGRATION: Invalid URL for featured image: {$first_img_url}");
+            return array('content' => $content, 'image_url' => '');
+        }
+        
+        // Handle relative URLs
+        if (strpos($first_img_url, '/') === 0 && strpos($first_img_url, '//') !== 0) {
+            // Try to convert relative URL to absolute using site URL as base
+            $first_img_url = site_url() . $first_img_url;
+            error_log("MIGRATION: Converted relative URL to absolute for featured image: {$first_img_url}");
+        }
+        
+        // Extract the filename
+        $filename = basename(parse_url($first_img_url, PHP_URL_PATH));
+        $filename_base = pathinfo($filename, PATHINFO_FILENAME);
+        
+        // Check if we already have a featured image for this post
+        if (has_post_thumbnail($post_id)) {
+            error_log("MIGRATION: Post already has a featured image. Skipping extraction.");
+            return array('content' => $content, 'image_url' => '');
+        }
+        
+        // Check if image already exists in media library
+        $existing_attachment = $this->find_existing_attachment_by_filename($filename_base);
+        $featured_image_set = false;
+        
+        if ($existing_attachment) {
+            error_log("MIGRATION: Using existing image from media library as featured image: {$first_img_url}");
+            
+            // Set as featured image
+            $result = set_post_thumbnail($post_id, $existing_attachment->ID);
+            $featured_image_set = $result;
+            $featured_image_url = $first_img_url;
+            
+            // Extract alt text from original img tag
+            $alt_text = '';
+            if (preg_match('/alt=["|\']([^"\']+)["|\'][^>]*/i', $first_img_tag, $alt_matches)) {
+                $alt_text = $alt_matches[1];
+            } else {
+                // Default alt text based on post title
+                $post = get_post($post_id);
+                $alt_text = $post ? $post->post_title : '';
+            }
+            
+            // Update alt text for the existing attachment if needed
+            update_post_meta($existing_attachment->ID, '_wp_attachment_image_alt', $alt_text);
+            
+            error_log("MIGRATION: Set existing image as featured image. Image URL: {$first_img_url}, Post ID: {$post_id}");
+        } else if (strpos($first_img_url, 'data:') !== 0) { // Don't process data URIs
+            // Download and set as featured image
+            $attachment_id = $this->download_and_upload_image($first_img_url, $post_id);
+            if ($attachment_id) {
+                $result = set_post_thumbnail($post_id, $attachment_id);
+                $featured_image_set = $result;
+                $featured_image_url = $first_img_url;
+                
+                // Extract alt text from original img tag
+                $alt_text = '';
+                if (preg_match('/alt=["|\']([^"\']+)["|\'][^>]*/i', $first_img_tag, $alt_matches)) {
+                    $alt_text = $alt_matches[1];
+                } else {
+                    // Default alt text based on post title
+                    $post = get_post($post_id);
+                    $alt_text = $post ? $post->post_title : '';
+                }
+                
+                // Update alt text for the new attachment
+                update_post_meta($attachment_id, '_wp_attachment_image_alt', $alt_text);
+                
+                error_log("MIGRATION: Set first image as featured image. Image URL: {$first_img_url}, Post ID: {$post_id}");
+            }
+        }
+        
+        // Remove the image from content if it was set as featured image
+        if ($featured_image_set) {
+            // Check if the image is wrapped in a paragraph or div
+            $parent_tag_pattern = '/<(?:p|div)[^>]*>\s*' . preg_quote($first_img_tag, '/') . '\s*<\/(?:p|div)>/is';
+            if (preg_match($parent_tag_pattern, $updated_content, $parent_matches)) {
+                // Remove the entire parent element with the image
+                $updated_content = str_replace($parent_matches[0], '', $updated_content);
+                error_log("MIGRATION: Removed featured image with parent from content");
+            } else {
+                // Just remove the image
+                $updated_content = str_replace($first_img_tag, '', $updated_content);
+                error_log("MIGRATION: Removed featured image from content to avoid duplication");
+            }
+        }
+        
+        return array(
+            'content' => $updated_content,
+            'image_url' => $featured_image_url
+        );
+    }
+    
+    /**
+     * Remove featured image from content if it appears at the beginning
+     * 
+     * @param string $content The HTML content
+     * @param int $post_id The post ID
+     * @return string Updated content with duplicate featured image removed
+     */
+    private function remove_duplicate_featured_image($content, $post_id) {
+        // Skip if no featured image is set or no content
+        if (empty($content) || !has_post_thumbnail($post_id)) {
+            return $content;
+        }
+        
+        // Get featured image details
+        $thumbnail_id = get_post_thumbnail_id($post_id);
+        $featured_image_url = wp_get_attachment_url($thumbnail_id);
+        $featured_image_url_base = basename($featured_image_url);
+        
+        // Get featured image dimensions
+        $featured_image_meta = wp_get_attachment_metadata($thumbnail_id);
+        $featured_width = isset($featured_image_meta['width']) ? $featured_image_meta['width'] : 0;
+        $featured_height = isset($featured_image_meta['height']) ? $featured_image_meta['height'] : 0;
+        
+        // Extract all image tags
+        preg_match_all('/<img[^>]+src=["|\']([^"\']+)["|\'][^>]*>/i', $content, $matches);
+        
+        if (empty($matches[0])) {
+            return $content; // No images found
+        }
+        
+        $img_tags = $matches[0];
+        $img_urls = $matches[1];
+        
+        // Track duplicates removed
+        $duplicates_removed = 0;
+        
+        foreach ($img_tags as $index => $img_tag) {
+            $img_url = $img_urls[$index];
+            $img_url_base = basename($img_url);
+            $is_duplicate = false;
+            
+            // Check for direct match by URL or filename
+            if ($img_url == $featured_image_url || $img_url_base == $featured_image_url_base) {
+                $is_duplicate = true;
+                error_log("MIGRATION: Found exact duplicate featured image match: {$img_url}");
+            } else {
+                // Check by dimensions if available in the img tag
+                if ($featured_width > 0 && $featured_height > 0) {
+                    preg_match('/width=["\'](\d+)["\']/', $img_tag, $width_match);
+                    preg_match('/height=["\'](\d+)["\']/', $img_tag, $height_match);
+                    
+                    if (!empty($width_match) && !empty($height_match)) {
+                        $img_width = intval($width_match[1]);
+                        $img_height = intval($height_match[1]);
+                        
+                        // If dimensions match, it's likely the same image
+                        if ($img_width == $featured_width && $img_height == $featured_height) {
+                            $is_duplicate = true;
+                            error_log("MIGRATION: Found dimensional duplicate featured image match: {$img_url} ({$img_width}x{$img_height})");
+                        }
+                    }
+                }
+                
+                // Last resort, check for partial URL match 
+                if (!$is_duplicate) {
+                    // Break URLs into parts for better comparison
+                    $featured_parts = explode('/', $featured_image_url);
+                    $content_parts = explode('/', $img_url);
+                    
+                    // Get the last parts of the URLs (the filenames)
+                    $featured_var = array_pop($featured_parts);
+                    $content_var = array_pop($content_parts);
+                    
+                    // Remove URL parameters
+                    $featured_var = strtok($featured_var, '?');
+                    $content_var = strtok($content_var, '?');
+                    
+                    // Remove dimensions that might be added to the URL
+                    $featured_var = preg_replace('/-\d+x\d+(\.[a-zA-Z]{3,4})$/', '$1', $featured_var);
+                    $content_var = preg_replace('/-\d+x\d+(\.[a-zA-Z]{3,4})$/', '$1', $content_var);
+                    
+                    // Compare the sanitized filenames
+                    if (strcasecmp($featured_var, $content_var) === 0) {
+                        $is_duplicate = true;
+                        error_log("MIGRATION: Found sanitized filename duplicate featured image match: {$featured_var} equals {$content_var}");
+                    }
+                    
+                    // Check if one filename contains the other (for resized variations)
+                    // For example, "image.jpg" should match "image-300x200.jpg"
+                    if (!$is_duplicate) {
+                        $featured_base = pathinfo($featured_var, PATHINFO_FILENAME);
+                        $content_base = pathinfo($content_var, PATHINFO_FILENAME);
+                        
+                        if (stripos($content_base, $featured_base) !== false || stripos($featured_base, $content_base) !== false) {
+                            $is_duplicate = true;
+                            error_log("MIGRATION: Found partial duplicate image match: {$featured_var} contains {$content_var}");
+                            // Set a flag to exit both loops
+                            $duplicates_removed = 2; // This will cause the outer loop to break after this iteration
+                        }
+                    }
+                }
+            }
+            
+            // If match found, remove the image
+            if ($is_duplicate) {
+                // Check if this image is wrapped in a paragraph or div
+                $parent_tag_pattern = '/<(?:p|div|figure)[^>]*>\s*' . preg_quote($img_tag, '/') . '\s*<\/(?:p|div|figure)>/is';
+                if (preg_match($parent_tag_pattern, $content, $parent_matches)) {
+                    // Remove the entire parent element with the image
+                    $content = str_replace($parent_matches[0], '', $content);
+                    error_log("MIGRATION: Removed duplicate featured image with parent element from content. Image: {$img_url}");
+                } else {
+                    // Just remove the image tag
+                    $content = str_replace($img_tag, '', $content);
+                    error_log("MIGRATION: Removed duplicate featured image from content. Image: {$img_url}");
+                }
+                
+                $duplicates_removed++;
+                
+                // Only process the first 2 duplicates to avoid removing all instances
+                if ($duplicates_removed >= 2) {
+                    break;
+                }
+            }
+        }
+        
+        return $content;
+    }
+    
+    /**
+     * Checks if an image with the same visual content already exists
+     * This performs more advanced image duplicate detection
+     */
+    private function find_duplicate_image_by_content($image_path) {
+        if (!file_exists($image_path) || !function_exists('wp_generate_attachment_metadata')) {
+            return 0;
+        }
+        
+        // Get image info
+        $image_info = getimagesize($image_path);
+        if (!$image_info) {
+            error_log("MIGRATION: Cannot get image size for: " . $image_path);
+            return 0;
+        }
+        
+        // Extract image dimensions
+        $width = $image_info[0];
+        $height = $image_info[1];
+        $file_size = filesize($image_path);
+        
+        // Quick check based on dimensions and file size first
+        global $wpdb;
+        $potential_duplicates = $wpdb->get_results(
+            "SELECT p.ID, p.guid, pm.meta_value as metadata 
+            FROM {$wpdb->posts} p
+            LEFT JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_wp_attachment_metadata'
+            WHERE p.post_type = 'attachment' 
+            AND (p.post_mime_type LIKE 'image/jpeg' OR p.post_mime_type LIKE 'image/png')"
+        );
+        
+        // First look for exact size matches
+        foreach ($potential_duplicates as $attachment) {
+            if (empty($attachment->metadata)) {
+                continue;
+            }
+            
+            $meta = maybe_unserialize($attachment->metadata);
+            if (!$meta || !isset($meta['width']) || !isset($meta['height'])) {
+                continue;
+            }
+            
+            // Check for matching dimensions
+            if ($meta['width'] == $width && $meta['height'] == $height) {
+                $attachment_path = get_attached_file($attachment->ID);
+                if (!$attachment_path || !file_exists($attachment_path)) {
+                    continue;
+                }
+                
+                // Check file size
+                $att_file_size = filesize($attachment_path);
+                $size_diff_percent = abs($att_file_size - $file_size) / max($file_size, $att_file_size);
+                
+                // If dimensions match exactly and file size is within 10% difference, consider it a duplicate
+                if ($size_diff_percent < 0.1) {
+                    error_log("MIGRATION: Found duplicate image by exact dimensions and similar file size: " . basename($image_path) . " matches " . basename($attachment_path));
+                    return $attachment->ID;
+                }
+                
+                // For more precise matches, compare image signatures
+                $image_signature = $this->get_image_signature($image_path);
+                $attachment_signature = $this->get_image_signature($attachment_path);
+                
+                if (!empty($image_signature) && !empty($attachment_signature)) {
+                    $similarity = $this->compare_signatures($image_signature, $attachment_signature);
+                    if ($similarity > 0.9) {  // 90% threshold for considering images similar
+                        error_log("MIGRATION: Found duplicate image by content similarity: " . basename($image_path) . " matches " . basename($attachment_path) . " ({$similarity}%)");
+                        return $attachment->ID;
+                    }
+                }
+            }
+        }
+        
+        // If no exact dimension match, try the content comparison for all potential duplicates
+        $image_signature = $this->get_image_signature($image_path);
+        if (empty($image_signature)) {
+            return 0;
+        }
+        
+        foreach ($potential_duplicates as $attachment) {
+            $attachment_path = get_attached_file($attachment->ID);
+            if (!$attachment_path || !file_exists($attachment_path)) {
+                continue;
+            }
+            
+            $attachment_signature = $this->get_image_signature($attachment_path);
+            if (!empty($attachment_signature)) {
+                $similarity = $this->compare_signatures($image_signature, $attachment_signature);
+                if ($similarity > 0.85) {  // 85% threshold for considering images similar when dimensions differ
+                    error_log("MIGRATION: Found duplicate image by content similarity despite different dimensions: " . basename($image_path) . " matches " . basename($attachment_path) . " ({$similarity}%)");
+                    return $attachment->ID;
+                }
+            }
+        }
+        
+        return 0;
+    }
+    
+    /**
+     * Generate a simple signature/hash for an image to compare content
+     */
+    private function get_image_signature($image_path) {
+        // Simple implementation - could be enhanced with more sophisticated image hash algorithms
+        try {
+            if (!function_exists('imagecreatefromjpeg')) {
+                // GD library not available
+                return '';
+            }
+            
+            $extension = strtolower(pathinfo($image_path, PATHINFO_EXTENSION));
+            
+            if ($extension == 'jpg' || $extension == 'jpeg') {
+                $image = @imagecreatefromjpeg($image_path);
+            } elseif ($extension == 'png') {
+                $image = @imagecreatefrompng($image_path);
+            } else {
+                return '';
+            }
+            
+            if (!$image) {
+                return '';
+            }
+            
+            // Scale down to a small size for comparison
+            $width = imagesx($image);
+            $height = imagesy($image);
+            
+            // Ensure minimum dimensions for reliable comparison
+            if ($width < 10 || $height < 10) {
+                imagedestroy($image);
+                return '';
+            }
+            
+            $scale = min(16 / $width, 16 / $height);
+            $new_width = floor($width * $scale);
+            $new_height = floor($height * $scale);
+            
+            $resized = imagecreatetruecolor($new_width, $new_height);
+            imagecopyresampled($resized, $image, 0, 0, 0, 0, $new_width, $new_height, $width, $height);
+            imagedestroy($image);
+            
+            // Convert to grayscale and get pixel values
+            $signature = '';
+            for ($y = 0; $y < $new_height; $y++) {
+                for ($x = 0; $x < $new_width; $x++) {
+                    $rgb = imagecolorat($resized, $x, $y);
+                    $r = ($rgb >> 16) & 0xFF;
+                    $g = ($rgb >> 8) & 0xFF;
+                    $b = $rgb & 0xFF;
+                    $grey = round(($r + $g + $b) / 3);
+                    $signature .= $grey . ',';
+                }
+            }
+            
+            imagedestroy($resized);
+            return $signature;
+        } catch (Exception $e) {
+            error_log("MIGRATION ERROR: Failed to generate image signature: " . $e->getMessage());
+            return '';
+        }
+    }
+    
+    /**
+     * Compare two image signatures for similarity
+     */
+    private function compare_signatures($signature1, $signature2) {
+        if (empty($signature1) || empty($signature2)) {
+            return 0;
+        }
+        
+        $values1 = explode(',', $signature1);
+        $values2 = explode(',', $signature2);
+        
+        // Ensure both have the same length for comparison
+        $min_length = min(count($values1), count($values2));
+        if ($min_length < 10) {
+            return 0;  // Not enough data to compare
+        }
+        
+        $values1 = array_slice($values1, 0, $min_length);
+        $values2 = array_slice($values2, 0, $min_length);
+        
+        // Calculate similarity
+        $total_diff = 0;
+        $max_possible_diff = 255 * $min_length;  // Maximum difference possible
+        
+        for ($i = 0; $i < $min_length; $i++) {
+            if (isset($values1[$i]) && isset($values2[$i]) && is_numeric($values1[$i]) && is_numeric($values2[$i])) {
+                $total_diff += abs(intval($values1[$i]) - intval($values2[$i]));
+            }
+        }
+        
+        // Convert to similarity percentage (100% = identical, 0% = completely different)
+        return 1 - ($total_diff / $max_possible_diff);
+    }
+
+    /**
+     * Clean up resources after an error
+     */
+    private function cleanup_after_error() {
+        // Clear any potential locks
+        if (function_exists('wp_cache_flush')) {
+            wp_cache_flush();
+        }
+        
+        // Clear DB queries cache
+        $this->clear_wpdb_query_cache();
+        
+        // Release memory
+        if (function_exists('gc_collect_cycles')) {
+            gc_collect_cycles();
+        }
+        
+        // Ensure rewrite rules are flushed
+        flush_rewrite_rules();
+    }
+
+    /**
+     * Get a list of previously processed URLs from the checkpoint file
+     * 
+     * @return array Array of URLs as keys and post IDs as values
+     */
+    private function get_processed_urls() {
+        $checkpoint_file = WP_CONTENT_DIR . '/uploads/migration_checkpoint.json';
+        
+        if (!file_exists($checkpoint_file)) {
+            return array();
+        }
+        
+        $content = file_get_contents($checkpoint_file);
+        if (empty($content)) {
+            return array();
+        }
+        
+        $data = json_decode($content, true);
+        if (!is_array($data)) {
+            return array();
+        }
+        
+        return $data;
+    }
+
+    /**
+     * Save the list of processed URLs to the checkpoint file
+     * 
+     * @param array $processed_urls Array of URLs as keys and post IDs as values
+     */
+    private function save_processed_urls($processed_urls) {
+        $checkpoint_file = WP_CONTENT_DIR . '/uploads/migration_checkpoint.json';
+        $upload_dir = WP_CONTENT_DIR . '/uploads';
+        
+        // Make sure uploads directory exists
+        if (!is_dir($upload_dir)) {
+            if (!mkdir($upload_dir, 0755, true)) {
+                error_log("MIGRATION ERROR: Could not create uploads directory for checkpoint file");
+                return;
+            }
+        }
+        
+        // Save the checkpoint
+        $content = json_encode($processed_urls);
+        file_put_contents($checkpoint_file, $content);
+        
+        error_log("MIGRATION: Saved checkpoint with " . count($processed_urls) . " processed URLs");
+    }
+
+    /**
+     * Get an existing category by its exact name
+     * 
+     * @param string $name The category name to search for
+     * @return int|false Category ID if found, false otherwise
+     */
+    private function get_existing_category_by_name($name) {
+        // Try to find the category by exact name
+        $existing_term = get_term_by('name', $name, 'category');
+        if ($existing_term && !is_wp_error($existing_term)) {
+            return $existing_term->term_id;
+        }
+        
+        // If not found by exact name, try by slug
+        $slug = sanitize_title($name);
+        $existing_term = get_term_by('slug', $slug, 'category');
+        if ($existing_term && !is_wp_error($existing_term)) {
+            return $existing_term->term_id;
+        }
+        
+        return false;
+    }
+}
+
