@@ -1,10 +1,10 @@
 # WordPress Content Migrator
 
-A powerful WordPress plugin designed to migrate content from external websites into your WordPress site using CSV or Excel files. Developed by [ANCKR](https://anckr.com).
+A powerful WordPress plugin designed to migrate content from external websites into your WordPress site using CSV or Excel files, and perform advanced search and replace operations. Developed by [ANCKR](https://anckr.com).
 
 ## Description
 
-WordPress Content Migrator allows seamless transfer of content from any website to your WordPress installation without complex programming or database knowledge. The plugin handles the entire migration process including content extraction, HTML cleaning, metadata import, and proper formatting - all through a simple spreadsheet-based workflow. Ideal for website redesigns, content migrations, or consolidating multiple sites into a single WordPress installation.
+WordPress Content Migrator allows seamless transfer of content from any website to your WordPress installation without complex programming or database knowledge. The plugin handles the entire migration process including content extraction, HTML cleaning, metadata import, and proper formatting - all through a simple spreadsheet-based workflow. Additionally, it provides powerful search and replace functionality to modify your content across the entire WordPress database. Ideal for website redesigns, content migrations, content updates, or consolidating multiple sites into a single WordPress installation.
 
 ## Features
 
@@ -18,6 +18,11 @@ WordPress Content Migrator allows seamless transfer of content from any website 
 - **Publication Date Retention**: Extracts and preserves original publication dates for posts
 - **Batch Processing**: Processes large imports in batches to prevent timeouts
 - **Overwrite Protection**: Option to skip existing content to prevent duplicate entries
+- **Advanced Search and Replace**: Perform database-wide content updates with precision
+- **Dry Run Mode**: Preview search and replace changes before applying them
+- **Regular Expression Support**: Use powerful regex patterns for complex search operations
+- **Selective Table Updates**: Choose specific database tables for search and replace operations
+- **Case-Sensitive Search**: Option to perform case-sensitive or case-insensitive searches
 
 ## How It Works
 
@@ -82,4 +87,43 @@ The plugin includes extensive error logging to help diagnose issues. Check your 
 
 ## Sample File
 
-Use the "Generate Sample" button to download a sample CSV file with the correct format for your migration. 
+Use the "Generate Sample" button to download a sample CSV file with the correct format for your migration.
+
+## Search and Replace
+
+### Overview
+The Search and Replace feature allows you to find and replace text across your WordPress database safely and efficiently. This is particularly useful for:
+- Updating URLs after site migration
+- Fixing common content errors
+- Replacing outdated information
+- Modifying HTML or shortcode patterns
+- Bulk updating specific phrases or terms
+
+### How to Use Search and Replace
+
+1. Navigate to Tools → Content Migrator → Search and Replace
+2. Enter your search term in the "Search for" field
+3. Enter the replacement text in the "Replace with" field
+4. Choose your search options:
+   - Case-sensitive search
+   - Regular expression support
+   - Select specific database tables
+5. Click "Preview Changes" to see what will be affected
+6. If satisfied with the preview, click "Apply Changes"
+
+### Safety Features
+
+- **Backup Prompt**: The plugin recommends creating a database backup before performing replacements
+- **Preview Mode**: See all changes before they're applied
+- **Table Selection**: Limit changes to specific database tables
+- **Change Logging**: Keep track of all search and replace operations
+- **Undo Capability**: Option to reverse the most recent change
+
+### Best Practices for Search and Replace
+
+1. **Always Backup First**: Create a complete database backup before performing any replacements
+2. **Use Preview Mode**: Always preview changes before applying them
+3. **Start Small**: Test your search patterns on a single table before applying to the entire database
+4. **Be Specific**: Use precise search terms to avoid unintended replacements
+5. **Check Regular Expressions**: If using regex, verify your patterns in preview mode
+6. **Document Changes**: Keep track of major search and replace operations for future reference 
