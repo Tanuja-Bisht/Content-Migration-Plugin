@@ -1,0 +1,36 @@
+/**
+ * WordPress Content Migrator Admin CSS
+ */
+
+.wp-content-migrator-details {
+    margin-top: 20px;
+    overflow-x: auto;
+}
+
+.wp-content-migrator-details table {
+    margin-top: 10px;
+}
+
+.wp-content-migrator-details tr.success {
+    background-color: #e7f9e7;
+}
+
+.wp-content-migrator-details tr.error {
+    background-color: #fae7e7;
+}
+
+.wp-content-migrator-details tr.skipped {
+    background-color: #f9f7e7;
+}
+
+.card {
+    background: #fff;
+    border: 1px solid #ccd0d4;
+    border-radius: 4px;
+    margin-top: 20px;
+    padding: 15px;
+}
+
+.card h2 {
+    margin-top: 0;
+} 

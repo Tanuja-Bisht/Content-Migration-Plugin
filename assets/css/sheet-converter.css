@@ -1,0 +1,61 @@
+
+/* Sheet Converter CSS */
+.wcm-sheet-converter-wrap {
+    max-width: 1200px;
+    margin: 20px 0;
+}
+
+.wcm-sheet-converter-container {
+    background: #fff;
+    padding: 20px;
+    border: 1px solid #ddd;
+    margin-top: 20px;
+}
+
+.wcm-table-wrapper {
+    overflow-x: auto;
+    margin: 20px 0;
+}
+
+#wcm-upload-progress,
+#wcm-convert-progress {
+    display: flex;
+    align-items: center;
+    margin-top: 10px;
+}
+
+#wcm-upload-progress .spinner,
+#wcm-convert-progress .spinner {
+    float: none;
+    margin-top: 0;
+    margin-right: 10px;
+}
+
+.wcm-result-actions {
+    margin-top: 20px;
+}
+
+.wcm-result-actions button {
+    margin-right: 10px;
+}
+
+#wcm-result-preview {
+    margin-top: 20px;
+}
+
+.wcm-table-wrapper table {
+    min-width: 100%;
+    border-collapse: collapse;
+}
+
+.wcm-table-wrapper table th,
+.wcm-table-wrapper table td {
+    word-break: break-word;
+    max-width: 300px;
+}
+
+@media screen and (max-width: 782px) {
+    .wcm-table-wrapper {
+        max-width: 100%;
+    }
+}

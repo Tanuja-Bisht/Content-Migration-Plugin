@@ -6,7 +6,6 @@ Before installing this plugin, ensure your server meets the following requiremen
 
 - PHP 7.4 or higher
 - WordPress 5.0 or higher
-- PHP ZIP extension enabled
 - PHP SimpleXML extension enabled
 
 ## Installation
@@ -20,17 +19,16 @@ That's it! No additional steps or configuration required.
 ## Supported File Formats
 
 The plugin supports the following file formats for content migration:
-- Excel (.xlsx) files
 - CSV files
 
 ## Troubleshooting
 
-If you see an error about missing PHP extensions, please contact your hosting provider to ensure the required extensions (ZIP and SimpleXML) are enabled on your server.
+If you see an error about missing PHP extensions, please contact your hosting provider to ensure the required extension (SimpleXML) is enabled on your server.
 
 ## Usage
 
 1. Go to "Content Migrator" in the WordPress admin menu
-2. Upload an Excel file with content to migrate
+2. Upload a CSV file with content to migrate
 3. Configure migration options
 4. Click "Start Migration"
 
