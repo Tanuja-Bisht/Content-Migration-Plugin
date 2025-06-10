@@ -1,0 +1,48 @@
+.php-error #adminmenuback, .php-error #adminmenuwrap {
+    margin-top: 0;
+}
+
+/* Admin fixes for Content Migrator plugin */
+#adminmenuwrap {
+    position: fixed !important;
+    z-index: 9990;
+}
+#adminmenuback {
+    position: fixed !important;
+    z-index: 9989;
+}
+#wpcontent, #wpfooter {
+    margin-left: 160px;
+}
+.auto-fold #wpcontent, .auto-fold #wpfooter {
+    margin-left: 160px;
+}
+@media screen and (max-width: 782px) {
+    .auto-fold #wpcontent, .auto-fold #wpfooter {
+        margin-left: 0;
+    }
+}
+.php-error {
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+}
+
+/* Ensure Content Migrator menu is highlighted when on the Search and Replace page */
+body.admin_page_custom-search-replace-migrator #toplevel_page_content-migrator,
+body.admin_page_custom-search-replace-migrator #toplevel_page_content-migrator > a {
+    background-color: #0073aa;
+    color: #fff;
+}
+
+body.admin_page_custom-search-replace-migrator #toplevel_page_content-migrator > a::after {
+    right: 0;
+    border: solid 8px transparent;
+    content: " ";
+    height: 0;
+    width: 0;
+    position: absolute;
+    pointer-events: none;
+    border-right-color: #f1f1f1;
+    top: 50%;
+    margin-top: -8px;
+}

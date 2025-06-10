@@ -307,7 +307,7 @@ class Excel_Processor {
         // Track processed titles to prevent duplicates within the same import
         $processed_titles = array();
         
-        // ADDED: Load previously processed URLs to prevent duplicates across sessions
+        // IMPROVED: Load previously processed URLs to prevent duplicates across sessions
         $processed_urls = $this->get_processed_urls();
         error_log("MIGRATION: Loaded " . count($processed_urls) . " previously processed URLs");
         
@@ -406,48 +406,186 @@ class Excel_Processor {
             $new_url = isset($row_data['new_url']) ? trim($row_data['new_url']) : '';
             $new_url = '/' . ltrim(trim($new_url), '/');  // Normalize URL format
             
-            // DISABLED: Skip checking for previous processing
-            /*
-            // ADDED: Check if this URL has already been processed in a previous batch
-            if (!empty($new_url) && isset($processed_urls[$new_url])) {
+            // IMPROVED: Check for already processed URLs from previous imports
+            if (!empty($new_url) && !$allow_overwrite && isset($processed_urls[$new_url])) {
                 $existing_post_id = $processed_urls[$new_url];
                 $existing_post = get_post($existing_post_id);
+                
                 if ($existing_post) {
-                    error_log("MIGRATION: Skipping already processed URL from previous batch: {$new_url} (Post ID: {$existing_post_id})");
+                    error_log("MIGRATION: Skipping already processed URL: {$new_url} (Post ID: {$existing_post_id})");
+                    
+                    // Get the title from the row data or existing post
+                    $title = isset($row_data['title']) ? $row_data['title'] : $existing_post->post_title;
+                    
                     $result = array(
                         'status' => 'skipped',
-                        'message' => "URL already processed in a previous batch: '{$new_url}' (ID: {$existing_post_id}). Skipped.",
-                        'title' => isset($row_data['title']) ? $row_data['title'] : $existing_post->post_title,
+                        'message' => "URL already processed in previous import: {$new_url} (ID: {$existing_post_id})",
+                        'title' => $title,
                         'slug' => $existing_post->post_name,
-                        'url' => $new_url
+                        'url' => $new_url,
+                        'post_id' => $existing_post_id
                     );
+                    
                     $results['skipped']++;
                     $results['details'][] = array_merge(array('row' => $index + 1, 'url' => $new_url), $result);
-                    continue;  // Skip to next row
+                    continue;  // Skip to next row without processing
                 }
             }
-            */
             
-            // Get title without checking for duplicates
-            $title = isset($row_data['title']) ? trim($row_data['title']) : '';
+            // Continue with the existing duplicate detection
+            if (!empty($new_url) && !$allow_overwrite) {
+                // Extract required info for checking
+                $full_path = ltrim($new_url, '/');
+                $type = isset($row_data['type']) ? strtolower(trim($row_data['type'])) : 'page';
+                $slug = $this->extract_slug($new_url);
+                $title = isset($row_data['title']) ? trim($row_data['title']) : '';
+                
+                // Check for existing post with the exact same path
+                $existing_post = $this->find_existing_post_by_path($full_path, $type);
+                // If not found by path, try to find by slug (similar to process_row logic)
+                if (!$existing_post) {
+                    global $wpdb;
+                    $potential_posts = $wpdb->get_results($wpdb->prepare(
+                        "SELECT ID, post_parent, post_type FROM $wpdb->posts WHERE post_name = %s AND post_type = %s AND post_status IN ('publish', 'draft')",
+                        $slug,
+                        $type
+                    ));
+                    
+                    if (!empty($potential_posts)) {
+                        if ($type === 'post') {
+                            $existing_post = get_post($potential_posts[0]->ID);
+                        } else {
+                            // For pages, check parent relationship
+                            $expected_parent_id = 0;
+                            if (!empty($row_data['parent_url'])) {
+                                $parent_path = ltrim(trim($row_data['parent_url']), '/');
+                                $parent_post = get_page_by_path($parent_path, OBJECT, $type);
+                                if ($parent_post) {
+                                    $expected_parent_id = $parent_post->ID;
+                                }
+                            } else {
+                                $expected_parent_id = $this->determine_parent_by_path($full_path, $type);
+                            }
+                            
+                            foreach ($potential_posts as $page) {
+                                if ((int)$page->post_parent === (int)$expected_parent_id) {
+                                    $existing_post = get_post($page->ID);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // If we found an existing post, add it to processed_urls and skip processing
+                if ($existing_post) {
+                    // Add to our processed URLs list
+                    $processed_urls[$new_url] = $existing_post->ID;
+                    
+                    $existing_path = '';
+                    if ($type === 'page') {
+                        $existing_path = '/' . trim(get_page_uri($existing_post->ID), '/');
+                        
+                        // Skip processing entirely if URLs match exactly for pages
+                        $normalized_new_url = '/' . trim($new_url, '/');
+                        $normalized_existing_path = '/' . trim($existing_path, '/');
+                        
+                        if ($normalized_existing_path === $normalized_new_url) {
+                            error_log("MIGRATION: Early skip - Exact URL match found for page {$new_url}. Skipping processing entirely.");
+                            $result = array(
+                                'status' => 'skipped',
+                                'message' => "Page already exists at exact URL {$new_url}. Skipped.",
+                                'title' => $title ?: ucwords(str_replace('-', ' ', $slug)),
+                                'slug' => $slug,
+                                'url' => $new_url,
+                                'post_id' => $existing_post->ID
+                            );
+                            
+                            $results['skipped']++;
+                            $results['details'][] = array_merge(array('row' => $index + 1, 'url' => $new_url), $result);
+                            continue;  // Skip to next row without calling process_row
+                        }
+                    } else {
+                        // For posts, we check the slug match since permalinks may differ in structure
+                        $existing_slug = get_post_field('post_name', $existing_post->ID);
+                        
+                        // Extract the expected category from the URL for comparison
+                        $expected_category = '';
+                        $url_parts = explode('/', trim($new_url, '/'));
+                        if (!empty($url_parts[0])) {
+                            $expected_category = $url_parts[0];
+                        }
+                        
+                        // Get the post's assigned categories
+                        $post_categories = wp_get_post_categories($existing_post->ID, array('fields' => 'all'));
+                        $category_match = false;
+                        
+                        // Check if this post is in the expected category
+                        if (!empty($expected_category) && !empty($post_categories)) {
+                            foreach ($post_categories as $category) {
+                                if ($category->slug === $expected_category) {
+                                    $category_match = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // If no category in URL or post has no categories, consider it a match
+                            // This prevents duplicate posts with the same slug
+                            $category_match = true;
+                        }
+                        
+                        // Also consider explicit category from CSV if provided
+                        $csv_category = isset($row_data['categories']) ? trim($row_data['categories']) : '';
+                        if (!empty($csv_category) && !empty($post_categories)) {
+                            foreach ($post_categories as $category) {
+                                if (strtolower($category->name) === strtolower($csv_category)) {
+                                    $category_match = true;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Skip if the slug matches and either the category matches or we want to be strict about uniqueness
+                        if ($existing_slug === $slug && $category_match) {
+                            error_log("MIGRATION: Early skip - Post with slug '{$slug}' already exists. Skipping processing entirely.");
+                            $result = array(
+                                'status' => 'skipped',
+                                'message' => "Post with slug '{$slug}' already exists" . (!empty($expected_category) ? " in category '{$expected_category}'" : "") . ". Skipped.",
+                                'title' => $title ?: ucwords(str_replace('-', ' ', $slug)),
+                                'slug' => $slug,
+                                'url' => $new_url,
+                                'post_id' => $existing_post->ID
+                            );
+                            
+                            $results['skipped']++;
+                            $results['details'][] = array_merge(array('row' => $index + 1, 'url' => $new_url), $result);
+                            continue;  // Skip to next row without calling process_row
+                        }
+                    }
+                }
+            }
             
             // Process the row
             $result = $this->process_row($row_data, $allow_overwrite, true);
             
-            // If successful, add the title and URL to our processed lists
-            if ($result['status'] === 'success' && !empty($title)) {
-                $processed_titles[] = $title;
+            // If successful, add the post to our tracking lists
+            if ($result['status'] === 'success') {
+                // Add title to processed titles
+                $title = isset($row_data['title']) ? trim($row_data['title']) : '';
+                if (!empty($title)) {
+                    $processed_titles[] = $title;
+                }
                 
-                // ADDED: Store the URL and post ID in our processed URLs list
+                // Add to processed URLs list with post ID
                 if (!empty($new_url) && isset($result['post_id'])) {
                     $processed_urls[$new_url] = $result['post_id'];
+                    
                     // Save periodically to avoid losing progress on timeout
                     if ($index % 5 === 0) {
                         $this->save_processed_urls($processed_urls);
                     }
                     
                     // Clear WordPress caches immediately after each successful page creation
-                    // This helps ensure newly created parents are visible for subsequent child pages
                     $this->clear_wpdb_query_cache();
                     clean_post_cache($result['post_id']);
                     
@@ -482,7 +620,1728 @@ class Excel_Processor {
             }
         }
         
-        // ADDED: Save all processed URLs at the end
+        // Save all processed URLs at the end
+        $this->save_processed_urls($processed_urls);
+        
+        // Final flush of rewrite rules after all posts are created
+        flush_rewrite_rules();
+        
+        return $results;
+    }
+
+    /**
+     * Sort rows by hierarchy depth to ensure parents are processed before children
+     * 
+     * @param array $rows Array of row data
+     * @return array Sorted rows
+     */
+    private function sort_rows_by_hierarchy_depth($rows) {
+        // Function to calculate depth of a URL
+        $get_depth = function($url) {
+            $url = trim($url, '/');
+            // Count slashes to determine depth
+            return substr_count($url, '/') + 1;
+        };
+        
+        // Check for potential duplicates before sorting
+        $seen_urls = array();
+        $seen_slugs = array();
+        
+        foreach ($rows as $index => $row) {
+            $type = isset($row['type']) ? strtolower(trim($row['type'])) : 'page';
+            $new_url = isset($row['new_url']) ? trim($row['new_url'], '/') : '';
+            $slug = $this->extract_slug('/' . $new_url);
+            
+            // Check for duplicate URLs
+            if (!empty($new_url)) {
+                if (isset($seen_urls[$new_url])) {
+                    error_log("MIGRATION WARNING: Duplicate URL detected: '{$new_url}' at rows {$seen_urls[$new_url]} and {$index}");
+                } else {
+                    $seen_urls[$new_url] = $index;
+                }
+            }
+            
+            // For pages, check for duplicate slugs at the same level
+            if ($type === 'page' && !empty($slug)) {
+                $parent_path = '';
+                $parts = explode('/', $new_url);
+                if (count($parts) > 1) {
+                    array_pop($parts); // Remove slug
+                    $parent_path = implode('/', $parts);
+                }
+                
+                $slug_key = $type . '|' . $parent_path . '|' . $slug;
+                
+                if (isset($seen_slugs[$slug_key])) {
+                    error_log("MIGRATION WARNING: Duplicate page slug '{$slug}' with same parent '{$parent_path}' at rows {$seen_slugs[$slug_key]} and {$index}");
+                } else {
+                    $seen_slugs[$slug_key] = $index;
+                }
+            }
+            
+            // For posts, check for exact same title in same category
+            if ($type === 'post' && isset($row['h1']) && !empty($row['h1'])) {
+                $categories = isset($row['categories']) ? trim($row['categories']) : '';
+                $title_key = $type . '|' . $categories . '|' . $row['h1'];
+                
+                if (isset($seen_slugs[$title_key])) {
+                    error_log("MIGRATION WARNING: Duplicate post title '{$row['h1']}' in same categories '{$categories}' at rows {$seen_slugs[$title_key]} and {$index}");
+                } else {
+                    $seen_slugs[$title_key] = $index;
+                }
+            }
+        }
+        
+        // Build dependency tree based on parent_url
+        $url_to_index = array();
+        foreach ($rows as $index => $row) {
+            if (isset($row['new_url']) && !empty($row['new_url'])) {
+                $url_to_index[trim($row['new_url'], '/')] = $index;
+            }
+        }
+        
+        // Add a dependency count to each row
+        foreach ($rows as $index => &$row) {
+            $row['_dependency_level'] = 0;
+            
+            // Skip non-pages and URLs without slashes
+            $type = isset($row['type']) ? strtolower(trim($row['type'])) : 'page';
+            if ($type !== 'page') {
+                continue;
+            }
+            
+            // Check for explicit parent_url
+            if (!empty($row['parent_url'])) {
+                $parent_url = trim($row['parent_url'], '/');
+                if (!empty($parent_url)) {
+                    // Set dependency level based on parent URL
+                    $row['_dependency_level'] = 1;
+                    
+                    // Count dependency depth by tracing back parent URLs
+                    $current_url = $parent_url;
+                    $depth = 1;
+                    $max_depth = 10; // Prevent infinite loops
+                    
+                    while ($depth < $max_depth) {
+                        // Look for this URL's parent
+                        $parent_index = isset($url_to_index[$current_url]) ? $url_to_index[$current_url] : -1;
+                        
+                        if ($parent_index >= 0 && isset($rows[$parent_index]['parent_url']) && !empty($rows[$parent_index]['parent_url'])) {
+                            $current_url = trim($rows[$parent_index]['parent_url'], '/');
+                            $depth++;
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    $row['_dependency_level'] = $depth;
+                    error_log("MIGRATION: URL {$row['new_url']} has dependency level {$depth} from parent_url");
+                }
+            } else {
+                // Use URL structure to determine dependency depth
+                $url_depth = $get_depth($row['new_url']);
+                $row['_dependency_level'] = $url_depth - 1; // -1 because root level is 0
+                error_log("MIGRATION: URL {$row['new_url']} has dependency level {$url_depth} from URL depth");
+            }
+        }
+        
+        // First sort by post type to prioritize pages before posts
+        usort($rows, function($a, $b) use ($get_depth) {
+            // Put pages before posts
+            $type_a = isset($a['type']) ? strtolower(trim($a['type'])) : 'page';
+            $type_b = isset($b['type']) ? strtolower(trim($b['type'])) : 'page';
+            
+            if ($type_a === 'page' && $type_b === 'post') {
+                return -1;
+            }
+            if ($type_a === 'post' && $type_b === 'page') {
+                return 1;
+            }
+            
+            // Same type, sort by dependency level
+            $level_a = isset($a['_dependency_level']) ? $a['_dependency_level'] : 0;
+            $level_b = isset($b['_dependency_level']) ? $b['_dependency_level'] : 0;
+            
+            // Sort by dependency level (lower level first)
+            if ($level_a !== $level_b) {
+                return $level_a - $level_b;
+            }
+            
+            // If same dependency level, use URL depth as tiebreaker
+            $url_a = isset($a['new_url']) ? $a['new_url'] : '';
+            $url_b = isset($b['new_url']) ? $b['new_url'] : '';
+            
+            $depth_a = $get_depth($url_a);
+            $depth_b = $get_depth($url_b);
+            
+            // Sort by URL depth (lower depth first)
+            if ($depth_a !== $depth_b) {
+                return $depth_a - $depth_b;
+            }
+            
+            // If same depth, sort by URL alphabetically
+            return strcmp($url_a, $url_b);
+        });
+        
+        // Log the sorted order for debugging
+        error_log("MIGRATION: Sorted " . count($rows) . " rows by hierarchy depth");
+        foreach ($rows as $i => $row) {
+            $type = isset($row['type']) ? $row['type'] : 'unknown';
+            $url = isset($row['new_url']) ? $row['new_url'] : 'unknown';
+            $parent_url = isset($row['parent_url']) ? $row['parent_url'] : 'none';
+            $level = isset($row['_dependency_level']) ? $row['_dependency_level'] : 0;
+            $depth = $get_depth($url);
+            error_log("MIGRATION: Processing order [" . ($i+1) . "] Type: {$type}, Level: {$level}, Depth: {$depth}, URL: {$url}, Parent: {$parent_url}");
+            
+            // Clean up temporary data
+            unset($rows[$i]['_dependency_level']);
+        }
+        
+        return $rows;
+    }
+    
+    /**
+     * Cache parent IDs for more efficient processing
+     */
+    private function cache_parent_id($row_data, $current_index, $all_rows) {
+        // Skip if no new_url
+        if (empty($row_data['new_url'])) {
+            return $row_data;
+        }
+        
+        $new_url = '/' . ltrim(trim($row_data['new_url']), '/');
+        $type = isset($row_data['type']) ? strtolower(trim($row_data['type'])) : 'page';
+        
+        // If it's a post or doesn't have a parent, return as is
+        if ($type !== 'page' || strpos(trim($new_url, '/'), '/') === false) {
+            return $row_data;
+        }
+        
+        // Check if explicit parent_url is provided
+        if (!empty($row_data['parent_url'])) {
+            $parent_url = '/' . ltrim(trim($row_data['parent_url']), '/');
+            $parent_path = ltrim($parent_url, '/');
+            
+            // Look for parent in already processed rows by matching parent_url to new_url
+            for ($i = 0; $i < $current_index; $i++) {
+                $potential_parent = $all_rows[$i];
+                $potential_parent_url = isset($potential_parent['new_url']) ? 
+                    '/' . ltrim(trim($potential_parent['new_url']), '/') : '';
+                
+                // Check if this is our parent
+                if (trim($potential_parent_url, '/') === $parent_path) {
+                    // If we found the parent and it has a post ID stored, cache it
+                    if (isset($potential_parent['_post_id'])) {
+                        $row_data['_cached_parent_id'] = $potential_parent['_post_id'];
+                        error_log("MIGRATION: Cached parent ID {$potential_parent['_post_id']} for {$new_url} using parent_url {$parent_url}");
+                        return $row_data;
+                    }
+                }
+            }
+            
+            // If we reach here, parent wasn't found in processed rows
+            error_log("MIGRATION: Parent for {$new_url} with parent_url {$parent_url} not found in processed rows");
+            return $row_data;
+        }
+        
+        // If no explicit parent_url, extract parent path from URL structure
+        $parts = explode('/', trim($new_url, '/'));
+        array_pop($parts); // Remove the last part (current slug)
+        $parent_path = implode('/', $parts);
+        
+        // Look for parent in already processed rows
+        for ($i = 0; $i < $current_index; $i++) {
+            $potential_parent = $all_rows[$i];
+            $potential_parent_url = isset($potential_parent['new_url']) ? 
+                '/' . ltrim(trim($potential_parent['new_url']), '/') : '';
+            
+            if (trim($potential_parent_url, '/') === $parent_path) {
+                // If we found the parent and it has a post ID stored, cache it
+                if (isset($potential_parent['_post_id'])) {
+                    $row_data['_cached_parent_id'] = $potential_parent['_post_id'];
+                    error_log("MIGRATION: Cached parent ID {$potential_parent['_post_id']} for {$new_url} from already processed row");
+                    break;
+                }
+            }
+        }
+        
+        return $row_data;
+    }
+    
+    /**
+     * Clear WordPress database query cache to free up memory
+     */
+    private function clear_wpdb_query_cache() {
+        global $wpdb;
+        
+        if (is_object($wpdb) && isset($wpdb->queries) && is_array($wpdb->queries)) {
+            $wpdb->queries = array();
+        }
+        
+        // Also clear object cache for posts
+        if (function_exists('wp_cache_flush_group')) {
+            wp_cache_flush_group('posts');
+        }
+    }
+
+    /**
+     * Get column indexes from headers
+     */
+    private function get_column_indexes_from_array($headers) {
+        $required_columns = array(
+            'migrate' => array('Migrate', 'MIGRATE', 'migrate'),
+            'menu_name' => array('Menu Name', 'MENU NAME', 'menu name'),
+            'old_url' => array('Old URL', 'OLD URL', 'old url'),
+            'new_url' => array('New URL', 'NEW URL', 'new url'),
+            'meta_title' => array('Meta Title', 'META TITLE', 'meta title'),
+            'h1' => array('H1', 'h1'),
+            'title' => array('Page/Post Title', 'PAGE/POST TITLE', 'page/post title', 'Title', 'TITLE', 'title'),
+            'featured_image' => array('Image', 'IMAGE', 'image', 'Featured Image', 'FEATURED IMAGE', 'featured image'),
+            'process_images' => array('Process Images', 'PROCESS IMAGES', 'process images'),
+            'type' => array('Type', 'TYPE', 'type'),
+            'categories' => array('Categories', 'CATEGORIES', 'categories', 'Category', 'CATEGORY', 'category'),
+            'auto_categories' => array('Auto Categories', 'AUTO CATEGORIES', 'auto categories', 'Auto_Categories', 'auto_categories')
+        );
+        
+        $column_indexes = array();
+        
+        // Log all headers for debugging
+        error_log("MIGRATION: Mapping headers: " . implode(', ', $headers));
+        
+        foreach ($required_columns as $key => $column_names) {
+            $found = false;
+            foreach ($headers as $col_index => $header) {
+                $header = trim($header);
+                // Check for exact match or common alternatives - case insensitive
+                foreach ($column_names as $column_name) {
+                if (strtolower($header) === strtolower($column_name)) {
+                    $column_indexes[$key] = $col_index;
+                    $found = true;
+                        error_log("MIGRATION: Mapped column '$column_name' to index $col_index (header: $header)");
+                        break 2; // Break both loops
+                    }
+                }
+            }
+            
+            if (!$found) {
+                // These columns are optional
+                if ($key === 'featured_image' || $key === 'process_images' || $key === 'categories' || $key === 'auto_categories') {
+                    $column_indexes[$key] = -1; // Set to -1 to indicate not found
+                    error_log("MIGRATION: Optional column not found for key '$key', setting to -1");
+                } else {
+                    $names_str = implode("', '", $column_names);
+                    throw new Exception("Required column not found in Excel file. Looking for one of: '$names_str'");
+                }
+            }
+        }
+        
+        return $column_indexes;
+    }
+
+    /**
+     * Recursively delete a directory
+     */
+    private function delete_directory($dir) {
+        if (!is_dir($dir)) {
+            return;
+        }
+        
+        $objects = scandir($dir);
+        foreach ($objects as $object) {
+            if ($object == "." || $object == "..") continue;
+            
+            $path = $dir . DIRECTORY_SEPARATOR . $object;
+            
+            if (is_dir($path)) {
+                $this->delete_directory($path);
+            } else {
+                unlink($path);
+            }
+        }
+        
+        rmdir($dir);
+    }
+
+    /**
+     * Process a single row of data
+     * 
+     * @param array $row_data Row data in key => value format
+     * @param bool $allow_overwrite Whether to overwrite existing content
+     * @param bool $skip_rewrite_flush Whether to skip flushing rewrite rules
+     * @return array Results of the operation
+     */
+    private function process_row($row_data, $allow_overwrite, $skip_rewrite_flush = false) {
+        // Extract row data
+        $old_url = isset($row_data['old_url']) ? trim($row_data['old_url']) : '';
+        $new_url = isset($row_data['new_url']) ? trim($row_data['new_url']) : '';
+        $meta_title = isset($row_data['meta_title']) ? trim($row_data['meta_title']) : '';
+        $page_title = isset($row_data['title']) ? trim($row_data['title']) : '';
+        $h1 = isset($row_data['h1']) ? trim($row_data['h1']) : '';
+        $featured_image = isset($row_data['featured_image']) ? trim($row_data['featured_image']) : 'yes'; // Default to 'yes' to always extract first image
+        $type = isset($row_data['type']) ? strtolower(trim($row_data['type'])) : 'page';
+        $process_images = isset($row_data['process_images']) ? strtolower(trim($row_data['process_images'])) : 'yes';
+        $parent_url = isset($row_data['parent_url']) ? trim($row_data['parent_url']) : '';
+        $categories = isset($row_data['categories']) && $row_data['categories'] !== -1 ? trim($row_data['categories']) : '';
+        $auto_categories = isset($row_data['auto_categories']) && $row_data['auto_categories'] !== -1 ? strtolower(trim($row_data['auto_categories'])) : 'no';
+        
+        // Ensure type is valid
+        if ($type !== 'post' && $type !== 'page') {
+            $type = 'page'; // Default to page
+        }
+        
+        // Ensure we have required data
+        if (empty($new_url)) {
+            return array(
+                'status' => 'error',
+                'message' => 'Missing required field: New URL',
+                'title' => isset($row_data['title']) ? $row_data['title'] : '(no title)',
+                'slug' => isset($row_data['slug']) ? $row_data['slug'] : '(no slug)'
+            );
+        }
+        
+        // Normalize new_url - ensure it starts with a slash and doesn't end with one
+        $new_url = '/' . ltrim(trim($new_url), '/');
+        $new_url = rtrim($new_url, '/');
+        
+        // Generate slug from new URL
+        $slug = $this->extract_slug($new_url);
+        
+        // Build the full path for finding existing posts and establishing parent-child relationships
+        $full_path = ltrim($new_url, '/');
+        
+        // Improved check for existing post with the exact same path - handling parent-child correctly
+        $existing_post = $this->find_existing_post_by_path($full_path, $type);
+        
+        // If not found by path, try to find by slug for both pages and posts
+        if (!$existing_post) {
+            global $wpdb;
+            $potential_posts = $wpdb->get_results($wpdb->prepare(
+                "SELECT ID, post_parent, post_type FROM $wpdb->posts WHERE post_name = %s AND post_type = %s AND post_status IN ('publish', 'draft')",
+            $slug,
+                $type
+            ));
+            
+            if (!empty($potential_posts)) {
+                // For posts, just use the first matching post by slug since posts don't have hierarchy
+                if ($type === 'post') {
+                    $existing_post = get_post($potential_posts[0]->ID);
+                    error_log("MIGRATION: Found existing post with matching slug: {$slug} (ID: {$potential_posts[0]->ID})");
+        } else {
+                    // For pages, check for matching parent as before
+                // Get the parent ID we would assign
+                $expected_parent_id = 0;
+                if (!empty($parent_url)) {
+                    // Find parent by explicit parent_url
+                    $parent_path = ltrim(trim($parent_url), '/');
+                    $parent_post = get_page_by_path($parent_path, OBJECT, $type);
+                    if ($parent_post) {
+                        $expected_parent_id = $parent_post->ID;
+                    }
+                } else {
+                    // Determine parent from URL structure
+                    $expected_parent_id = $this->determine_parent_by_path($full_path, $type);
+                }
+                
+                // Check if any of the existing pages with this slug has the correct parent
+                    foreach ($potential_posts as $page) {
+                    if ((int)$page->post_parent === (int)$expected_parent_id) {
+                        $existing_post = get_post($page->ID);
+                        error_log("MIGRATION: Found existing page with matching slug and parent: {$slug} (ID: {$page->ID}, Parent: {$page->post_parent})");
+                        break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Modified to check the exact URL match
+        if ($existing_post) {
+            // Get the actual URL path of the existing post
+            $existing_path = '';
+            if ($type === 'page') {
+                $existing_path = '/' . trim(get_page_uri($existing_post->ID), '/');
+            } else {
+                $existing_path = '/' . trim(get_post_field('post_name', $existing_post->ID), '/');
+            }
+            
+            // Normalize both URLs for comparison
+            $normalized_new_url = '/' . trim($new_url, '/');
+            $normalized_existing_path = '/' . trim($existing_path, '/');
+            
+            // Only skip if the exact URL matches
+            if ($normalized_existing_path === $normalized_new_url) {
+                error_log("MIGRATION: Exact URL match found. Skipping.");
+                return array(
+                    'status' => 'skipped',
+                    'message' => "Content already exists at exact URL {$new_url}. Skipped.",
+                    'title' => $page_title,
+                    'slug' => $slug
+                );
+            }
+            // If URLs don't match exactly, continue with import
+        }
+        
+        // Scrape content from old URL only if needed
+        $content = '';
+        $scraped_data = array(); // Initialize scraped_data variable
+        if (!empty($old_url) && filter_var($old_url, FILTER_VALIDATE_URL)) {
+            error_log("Scraping content from: {$old_url}");
+            $scraped_data = $this->scrape_content($old_url);
+            
+            if (!empty($scraped_data['content'])) {
+                $content = $scraped_data['content'];
+                
+                // Use scraped title and H1 if not explicitly provided
+                if (empty($page_title) && !empty($scraped_data['title'])) {
+                    $page_title = $scraped_data['title'];
+                }
+                
+                if (empty($h1) && !empty($scraped_data['h1'])) {
+                    $h1 = $scraped_data['h1'];
+                }
+            }
+        }
+        
+        // If we still don't have title or H1, use slug as fallback
+        if (empty($page_title)) {
+            $page_title = ucwords(str_replace('-', ' ', $slug));
+        }
+        
+        if (empty($h1)) {
+            $h1 = $page_title;
+        }
+        
+        // If meta title is still empty, use page title
+        if (empty($meta_title)) {
+            $meta_title = $page_title;
+        }
+        
+        // Get or determine parent for hierarchical URLs
+        // First check if explicit parent_url is provided in CSV
+        $post_parent = 0;
+        if (!empty($parent_url)) {
+            // Normalize parent_url to ensure it starts with a slash
+            $parent_url = '/' . ltrim(trim($parent_url), '/');
+            $parent_path = ltrim($parent_url, '/');
+            
+            // Find parent post by its URL path
+            $parent_post = get_page_by_path($parent_path, OBJECT, $type);
+            if ($parent_post) {
+                $post_parent = $parent_post->ID;
+                error_log("MIGRATION: Found parent by explicit parent_url '{$parent_url}': ID {$post_parent}");
+            } else {
+                error_log("MIGRATION WARNING: Specified parent_url '{$parent_url}' not found, trying URL-based parent determination");
+                
+                // For multi-level hierarchy, we need to ensure parent exists
+                // Check if we're dealing with a multi-level path
+                $parent_parts = explode('/', $parent_path);
+                if (count($parent_parts) > 1) {
+                    error_log("MIGRATION: Processing multi-level parent path: {$parent_path}");
+                    
+                    // Build each level of the parent path
+                    $accumulated_path = '';
+                    $current_parent_id = 0;
+                    
+                    foreach ($parent_parts as $i => $part) {
+                        if (empty($part)) continue;
+                        
+                        // Add this segment to our accumulated path
+                        if (!empty($accumulated_path)) {
+                            $accumulated_path .= '/';
+                        }
+                        $accumulated_path .= $part;
+                        
+                        // Check if this level exists
+                        $level_post = get_page_by_path($accumulated_path, OBJECT, $type);
+                        
+                        if ($level_post) {
+                            // This level exists, use its ID as parent for next level
+                            $current_parent_id = $level_post->ID;
+                            error_log("MIGRATION: Found existing parent level at '{$accumulated_path}': ID {$current_parent_id}");
+                        } else {
+                            // This level doesn't exist yet - might want to create it
+                            error_log("MIGRATION WARNING: Parent level '{$accumulated_path}' doesn't exist in hierarchy");
+                            break;
+                        }
+                    }
+                    
+                    // If we found a valid parent ID from the hierarchy, use it
+                    if ($current_parent_id > 0) {
+                        $post_parent = $current_parent_id;
+                    }
+                }
+            }
+        }
+        
+        // If no explicit parent or parent not found, use the URL structure
+        if ($post_parent == 0) {
+            if (isset($row_data['_cached_parent_id'])) {
+                $post_parent = $row_data['_cached_parent_id'];
+            } else {
+                $post_parent = $this->determine_parent_by_path($full_path, $type);
+            }
+        }
+        
+        // Debug parent relationship
+        error_log("MIGRATION: URL '{$new_url}' with slug '{$slug}' has parent ID: {$post_parent}");
+            
+            // Prepare post data
+            $post_data = array(
+            'post_title' => $page_title,
+                'post_name' => $slug,
+            'post_content' => ($type === 'post') ? $this->prepare_post_content($content, $h1, $meta_title) : $this->prepare_page_content($content, $h1, $meta_title),
+                'post_status' => 'publish',
+            'post_type' => $type,
+            'post_parent' => $post_parent,
+            );
+            
+            // ADDED: For posts, better date handling with priority order
+            if ($type === 'post') {
+                $found_date = null;
+                
+                // PRIORITY 1: Explicit date from CSV/Excel date column
+                if (isset($row_data['date']) && !empty($row_data['date'])) {
+                    $explicit_date = trim($row_data['date']);
+                    $timestamp = strtotime($explicit_date);
+                    
+                    if ($timestamp !== false) {
+                        $formatted_date = date('Y-m-d H:i:s', $timestamp);
+                        $found_date = $formatted_date;
+                        error_log("MIGRATION: Using explicit date from CSV/Excel: {$formatted_date}");
+                    } else {
+                        error_log("MIGRATION WARNING: Could not parse date from CSV: {$explicit_date}");
+                    }
+                }
+                
+                // PRIORITY 2: Date extracted from scraped content
+                if (!$found_date && !empty($old_url) && !empty($scraped_data) && !empty($scraped_data['html'])) {
+                    $publication_date = $this->extract_publication_date($scraped_data['html']);
+                    
+                    // Only use if it's not the default current date
+                    if ($publication_date && $publication_date !== current_time('mysql')) {
+                        $found_date = $publication_date;
+                        error_log("MIGRATION: Using date extracted from scraped content: {$publication_date}");
+                    }
+                }
+                
+                // PRIORITY 3: Date from modified time of source if available
+                if (!$found_date && !empty($scraped_data) && isset($scraped_data['last_modified'])) {
+                    $modified_date = $scraped_data['last_modified'];
+                    $timestamp = strtotime($modified_date);
+                    
+                    if ($timestamp !== false) {
+                        $formatted_date = date('Y-m-d H:i:s', $timestamp);
+                        $found_date = $formatted_date;
+                        error_log("MIGRATION: Using last-modified date from source: {$formatted_date}");
+                    }
+                }
+                
+                // Set the date in post data if found
+                if ($found_date) {
+                    $post_data['post_date'] = $found_date;
+                    $post_data['post_date_gmt'] = get_gmt_from_date($found_date);
+                    $post_data['post_modified'] = $found_date;
+                    $post_data['post_modified_gmt'] = get_gmt_from_date($found_date);
+                    
+                    // Debug log to verify date is being set
+                    error_log("MIGRATION: Final post date selected: {$found_date}");
+                } else {
+                    error_log("MIGRATION WARNING: Could not determine publication date for post. Using current date.");
+                }
+            }
+            
+        // Check if we have a date column in the CSV/Excel file
+        if ($type === 'post' && isset($row_data['date']) && !empty($row_data['date'])) {
+            $explicit_date = trim($row_data['date']);
+            
+            // Try to parse this date
+            $timestamp = strtotime($explicit_date);
+            if ($timestamp !== false) {
+                $formatted_date = date('Y-m-d H:i:s', $timestamp);
+                $post_data['post_date'] = $formatted_date;
+                $post_data['post_date_gmt'] = get_gmt_from_date($formatted_date);
+                $post_data['post_modified'] = $formatted_date;
+                $post_data['post_modified_gmt'] = get_gmt_from_date($formatted_date);
+                
+                error_log("MIGRATION: Using explicit date from CSV: {$formatted_date}");
+            } else {
+                error_log("MIGRATION WARNING: Could not parse date from CSV: {$explicit_date}");
+            }
+        }
+        
+        // If we're updating an existing post
+            update_existing_post:
+            if ($existing_post) {
+                $post_data['ID'] = $existing_post->ID;
+                $post_id = wp_update_post($post_data);
+                $action = 'updated';
+            } else {
+                $post_id = wp_insert_post($post_data);
+                $action = 'created';
+            }
+            
+            if (is_wp_error($post_id)) {
+                return array(
+                    'status' => 'error',
+                    'message' => "Failed to {$action} {$type}: " . $post_id->get_error_message(),
+                    'title' => $page_title,
+                    'slug' => $slug
+                );
+            }
+        
+        // Store original URLs and other metadata
+        update_post_meta($post_id, '_content_migrator_old_url', $old_url);
+        update_post_meta($post_id, '_content_migrator_new_url', $new_url);
+        update_post_meta($post_id, '_yoast_wpseo_title', $meta_title);
+
+        // Save meta description to Yoast SEO meta description field if available from scraped data
+        if (!empty($scraped_data['meta_description'])) {
+            update_post_meta($post_id, '_yoast_wpseo_metadesc', $scraped_data['meta_description']);
+            error_log("MIGRATION: Saved meta description to Yoast SEO for post ID {$post_id}: " . substr($scraped_data['meta_description'], 0, 50));
+        }
+        
+        // Quick processing for internal links
+        $updated_content = $post_data['post_content'];
+        if (!empty($old_url)) {
+            $updated_content = str_replace($old_url, $new_url, $updated_content);
+        }
+        
+        // Process images if requested
+        if ($process_images === 'yes' && !empty($updated_content) && !empty($old_url)) {
+            $content_with_images = $this->process_content_images($updated_content, $post_id, $old_url);
+            
+            if ($content_with_images !== $updated_content) {
+                $updated_content = $content_with_images;
+            }
+        }
+        
+        // Set featured image if specified
+        if (!empty($featured_image)) {
+            if (strtolower($featured_image) === 'yes' || strtolower($featured_image) === 'auto') {
+                $extract_result = $this->extract_first_image_as_featured($updated_content, $post_id);
+                if (!empty($extract_result['content']) && $extract_result['content'] !== $updated_content) {
+                    $updated_content = $extract_result['content'];
+                    // Also ensure any other instances of the same image are removed
+                    $updated_content = $this->remove_duplicate_featured_image($updated_content, $post_id);
+                }
+            } else if (filter_var($featured_image, FILTER_VALIDATE_URL)) {
+                $this->set_featured_image($post_id, $featured_image);
+                // ADDED: Explicitly remove the featured image from the content if it appears there
+                $updated_content = $this->remove_duplicate_featured_image($updated_content, $post_id);
+            }
+        } else if (!empty($updated_content)) {
+            // If no featured image specified but we have content, try to extract one
+            error_log("MIGRATION: No featured image specified, attempting to extract one from content for post ID: {$post_id}");
+            $extract_result = $this->extract_first_image_as_featured($updated_content, $post_id);
+            if (!empty($extract_result['content']) && $extract_result['content'] !== $updated_content) {
+                $updated_content = $extract_result['content'];
+                // Also ensure any other instances of the same image are removed
+                $updated_content = $this->remove_duplicate_featured_image($updated_content, $post_id);
+            }
+        }
+        
+        // Update the post with all content changes
+        if ($updated_content !== $post_data['post_content']) {
+            wp_update_post(array(
+                'ID' => $post_id,
+                'post_content' => $updated_content
+            ));
+        }
+        
+        // ADDED: Force additional check to ensure featured image is removed from content
+        if (has_post_thumbnail($post_id)) {
+            error_log("MIGRATION: Performing final check to ensure featured image is removed from content for post ID: {$post_id}");
+            
+            // Get the current post content - it might have been updated already
+            $current_post = get_post($post_id);
+            $current_content = $current_post->post_content;
+            
+            // Remove date and author line from content
+            $date_author_pattern = '/<p>(?:Posted on|Posted|Published on|Published|Date:)?\s*(?:by)?\s*(?:[A-Za-z]+\s+\d+,\s+\d{4}|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d+,\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4}|\d{4}-\d{2}-\d{2})\s*(?:by|–|—|-)?\s*(?:[A-Za-z\s\.]+)?<\/p>/is';
+            $current_content = preg_replace($date_author_pattern, '', $current_content);
+            
+            // Get featured image URL and perform more aggressive removal
+            $thumbnail_id = get_post_thumbnail_id($post_id);
+            $featured_image_url = wp_get_attachment_url($thumbnail_id);
+            $featured_image_base = basename($featured_image_url);
+            
+            // Get all sizes of the featured image
+            $featured_image_sizes = array();
+            $sizes = get_intermediate_image_sizes();
+            foreach ($sizes as $size) {
+                $size_data = wp_get_attachment_image_src($thumbnail_id, $size);
+                if ($size_data) {
+                    $featured_image_sizes[] = $size_data[0];
+                }
+            }
+            
+            // Check if any of these URLs appear in the content
+            $found_in_content = false;
+            
+            // Check for the main featured image URL
+            if (strpos($current_content, $featured_image_url) !== false) {
+                $found_in_content = true;
+            }
+            
+            // Check for other sizes
+            if (!$found_in_content) {
+                foreach ($featured_image_sizes as $size_url) {
+                    if (strpos($current_content, $size_url) !== false) {
+                        $found_in_content = true;
+                        break;
+                    }
+                }
+            }
+            
+            // Check for the image filename
+            if (!$found_in_content) {
+                if (strpos($current_content, $featured_image_base) !== false) {
+                    $found_in_content = true;
+                }
+            }
+            
+            // If found, perform a more aggressive cleanup
+            if ($found_in_content) {
+                error_log("MIGRATION: Featured image still found in content! Performing deep cleanup");
+                
+                // Double-check with a more thorough content cleanup
+                $cleaned_content = $this->remove_duplicate_featured_image($current_content, $post_id);
+                
+                // Check if anything changed
+                if ($cleaned_content !== $current_content) {
+                    error_log("MIGRATION: Successfully removed featured image in final check");
+                    
+                    // Update the post with the cleaned content
+                    wp_update_post(array(
+                        'ID' => $post_id,
+                        'post_content' => $cleaned_content
+                    ));
+                }
+            }
+        }
+        
+        // Add categories for posts - ONLY use explicit categories from CSV
+        if ($type === 'post') {
+            $category_ids = array();
+            
+            // Debug all post data to see what's coming in
+            error_log("MIGRATION DEBUG: Full row_data for post ID {$post_id}:");
+            error_log(print_r($row_data, true));
+            // Log category variable type and value
+            error_log("MIGRATION DEBUG: Categories variable: " . gettype($categories) . ", Value: '" . $categories . "'");
+            // If explicit categories are provided in CSV
+            if (!empty($categories)) {
+                error_log("MIGRATION DEBUG: Processing category: '{$categories}' for post ID: {$post_id}");
+                
+                // No longer splitting by comma - just use the exact category name as provided
+                $cat_name = trim($categories);
+                if (!empty($cat_name)) {
+                    error_log("MIGRATION DEBUG: Processing category: '{$cat_name}'");
+                    
+                    // Try to get existing category
+                    $existing_category = get_term_by('name', $cat_name, 'category');
+                    if ($existing_category && !is_wp_error($existing_category)) {
+                        $cat_id = $existing_category->term_id;
+                        error_log("MIGRATION DEBUG: Found existing category by exact name: '{$cat_name}' (ID: {$cat_id})");
+                    } else {
+                        // Try by slug
+                        $slug = sanitize_title($cat_name);
+                        $existing_category = get_term_by('slug', $slug, 'category');
+                        if ($existing_category && !is_wp_error($existing_category)) {
+                            $cat_id = $existing_category->term_id;
+                            error_log("MIGRATION DEBUG: Found existing category by slug: '{$slug}' (ID: {$cat_id})");
+                        } else {
+                            // Create new category
+                            error_log("MIGRATION DEBUG: Creating new category: '{$cat_name}' with slug: '{$slug}'");
+                            $result = wp_insert_term($cat_name, 'category');
+                            if (!is_wp_error($result)) {
+                                $cat_id = $result['term_id'];
+                                error_log("MIGRATION: Created new category: '{$cat_name}' (ID: {$cat_id})");
+                            } else {
+                                error_log("MIGRATION ERROR: Failed to create category '{$cat_name}': " . $result->get_error_message());
+                                $cat_id = 0;
+                            }
+                        }
+                    }
+                    if ($cat_id) {
+                        $category_ids[] = $cat_id;
+                        error_log("MIGRATION: Added category ID {$cat_id} to list for post ID: {$post_id}");
+                    }
+                }
+            } else {
+                error_log("MIGRATION DEBUG: No explicit category provided in CSV, categories variable is empty");
+                
+                // Check if the Categories column exists but is empty
+                error_log("MIGRATION DEBUG: Checking if 'categories' key exists in row_data: " . (isset($row_data['categories']) ? 'yes' : 'no'));
+                
+                // Use the auto_categories value we already extracted
+                error_log("MIGRATION DEBUG: auto_categories setting: {$auto_categories}");
+                
+                if ($auto_categories === 'yes') {
+                    // Determine from URL structure only if auto_categories is enabled
+                    $category_ids = $this->determine_post_categories_improved($new_url);
+                    error_log("MIGRATION: Determined categories from URL structure: " . implode(', ', $category_ids) . " for post ID: {$post_id}");
+                } else {
+                    // Use default category
+                    $default_category = get_option('default_category');
+                    if ($default_category) {
+                        $category_ids[] = $default_category;
+                        error_log("MIGRATION: Using default WordPress category for post ID: {$post_id}");
+                    }
+                }
+            }
+            
+            // Set the categories
+            if (!empty($category_ids)) {
+                error_log("MIGRATION: Setting " . count($category_ids) . " categories for post ID: {$post_id}: " . implode(', ', $category_ids));
+                
+                // Check if post exists before setting categories
+                $post_exists = get_post($post_id);
+                if ($post_exists) {
+                    // IMPORTANT: REPLACE categories rather than append
+                    $result = wp_set_post_categories($post_id, $category_ids, false);
+                    error_log("MIGRATION DEBUG: wp_set_post_categories result: " . var_export($result, true));
+                    
+                    // Verify the categories were actually set
+                    $assigned_cats = wp_get_post_categories($post_id);
+                    error_log("MIGRATION DEBUG: Categories after assignment: " . implode(', ', $assigned_cats));
+                    
+                    // Check if categories match what we expected
+                    $missing_cats = array_diff($category_ids, $assigned_cats);
+                    if (!empty($missing_cats)) {
+                        error_log("MIGRATION WARNING: Some categories were not assigned: " . implode(', ', $missing_cats));
+                    }
+                } else {
+                    error_log("MIGRATION ERROR: Post ID {$post_id} does not exist, cannot set categories");
+                }
+            } else {
+                error_log("MIGRATION WARNING: No valid categories found for post ID: {$post_id}");
+            }
+        }
+        
+        // Flush rewrite rules if needed
+        if (!$skip_rewrite_flush) {
+            flush_rewrite_rules();
+        }
+            
+            return array(
+                'status' => 'success',
+                'message' => ucfirst($type) . " {$action} successfully at {$new_url}",
+                'title' => $page_title,
+                'slug' => $slug,
+                'url' => $new_url,
+                'post_id' => $post_id  // ADDED: Include the post ID in the result
+            );
+    }
+
+    /**
+     * Find an existing post by its exact path
+     */
+        private function find_existing_post_by_path($path, $post_type) {
+        error_log("MIGRATION: Checking if post already exists at path: {$path}");
+        
+        // Direct lookup for exact path match
+        $post = get_page_by_path($path, OBJECT, $post_type);
+        if ($post) {
+            error_log("MIGRATION: Found existing post by exact path: {$path} (ID: {$post->ID})");
+            return $post;
+        }
+        
+        // Get the last segment as the slug for additional checks
+        $parts = explode('/', $path);
+        $slug = end($parts);
+        
+        // DISABLED: Aggressive check for any post with the same slug - this was causing false positives
+        // We only want exact path matches for hierarchical content
+        
+        // If not found and this is a page, we need to check more carefully for hierarchy
+        if ($post_type === 'page') {
+            // Find all pages with this slug
+            global $wpdb;
+            $potential_posts = $wpdb->get_results($wpdb->prepare(
+                "SELECT ID, post_title, post_parent FROM $wpdb->posts WHERE post_name = %s AND post_type = 'page' AND post_status IN ('publish', 'draft')",
+                $slug
+            ));
+            
+            if ($potential_posts) {
+                // For a more thorough check, we need to verify the full path matches
+                foreach ($potential_posts as $potential_post) {
+                    // Get the full hierarchical path for this post
+                    $post_path = $this->get_post_path($potential_post->ID);
+                    
+                    if ($post_path === $path) {
+                        error_log("MIGRATION: Found existing page by matching full path hierarchy: {$path} (ID: {$potential_post->ID})");
+                        return get_post($potential_post->ID);
+                    }
+                }
+                
+                // If we get here, no exact path match was found, just similar slugs
+                error_log("MIGRATION: Found pages with slug '{$slug}', but none matched the full path '{$path}'");
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Determine parent based on exact path
+     */
+    private function determine_parent_by_path($path, $post_type) {
+        if (empty($path) || $post_type !== 'page') {
+            return 0;
+        }
+        
+        // Find the parent path by removing the last segment
+        $path_parts = explode('/', $path);
+        
+        // If there's only one part, there's no parent
+        if (count($path_parts) <= 1) {
+            return 0;
+        }
+        
+        // Remove the last part (current slug)
+        array_pop($path_parts);
+        $parent_path = implode('/', $path_parts);
+        
+        // Find the parent by path
+        $parent = get_page_by_path($parent_path, OBJECT, $post_type);
+        
+        // Debug parent lookup
+        if ($parent) {
+            error_log("MIGRATION: Found parent for '{$path}': {$parent->ID} at path '{$parent_path}'");
+        } else {
+            error_log("MIGRATION: No parent found for '{$path}' at path '{$parent_path}'");
+        }
+        
+        return $parent ? $parent->ID : 0;
+    }
+
+    /**
+     * Improved category determination for posts
+     */
+    private function determine_post_categories_improved($url) {
+        $url = trim($url, '/');
+        $parts = explode('/', $url);
+        $category_ids = array();
+        
+        // Only continue if we have parts to process
+        if (count($parts) > 0) {
+            // The first segment is usually the primary category for blog posts
+            $primary_cat_slug = $parts[0];
+            
+            // Default to 'blog' if not found or empty
+            if (empty($primary_cat_slug)) {
+                $primary_cat_slug = 'blog';
+            }
+            
+            $category_id = $this->get_or_create_category($primary_cat_slug);
+            if ($category_id) {
+                $category_ids[] = $category_id;
+                error_log("MIGRATION: Assigned post to category from URL: {$primary_cat_slug} (ID: {$category_id})");
+            }
+            
+            // For deeper URLs, also add the second segment as a subcategory if applicable
+            if (count($parts) > 1) {
+                $subcategory_slug = $parts[1];
+                $subcategory_id = $this->get_or_create_category($subcategory_slug, $category_id);
+                if ($subcategory_id && $subcategory_id != $category_id) {
+                    $category_ids[] = $subcategory_id;
+                    error_log("MIGRATION: Also assigned to subcategory from URL: {$subcategory_slug} (ID: {$subcategory_id})");
+                }
+            }
+        } else {
+            // If no path segments, assign to default 'blog' category
+            $category_id = $this->get_or_create_category('blog');
+            if ($category_id) {
+                $category_ids[] = $category_id;
+                error_log("MIGRATION: Assigned post to default 'blog' category (ID: {$category_id})");
+            }
+        }
+        
+        return $category_ids;
+    }
+
+    /**
+     * Get or create a category by slug, optionally as a child of another category
+     */
+    private function get_or_create_category($slug, $parent_id = 0, $name = '') {
+        // First, try to find existing category
+        $category = get_category_by_slug($slug);
+        
+        if ($category) {
+            return $category->term_id;
+        } else {
+            // Create the category if it doesn't exist
+            // Use provided name or convert slug to a proper name (capitalize words)
+            if (empty($name)) {
+                $name = ucwords(str_replace(array('-', '_'), ' ', $slug));
+            }
+            
+            // Add parent category if specified
+            $args = array();
+            if ($parent_id > 0) {
+                $args['parent'] = $parent_id;
+            }
+            
+            $result = wp_insert_term($name, 'category', $args);
+            
+            if (is_wp_error($result)) {
+                error_log("MIGRATION ERROR: Failed to create category '{$name}': " . $result->get_error_message());
+                return 0;
+            }
+            
+            return $result['term_id'];
+        }
+    }
+
+    /**
+     * Find existing post by slug or path
+     */
+    private function find_existing_post($slug, $post_type, $full_path = '') {
+        global $wpdb;
+        
+        // For hierarchical paths, we need to check the entire path
+        // This is especially important for pages
+        if (!empty($full_path) && $post_type === 'page') {
+            // Remove leading and trailing slashes for consistency
+            $full_path = trim($full_path, '/');
+            
+            // First try to find by exact path using get_page_by_path
+            $post = get_page_by_path($full_path, OBJECT, $post_type);
+            if ($post) {
+                error_log("MIGRATION: Found existing post by full path: {$full_path} (ID: {$post->ID})");
+                return $post;
+            }
+            
+            // If not found, try with just the slug but verify the path
+            $posts = get_posts(array(
+                'name' => $slug,
+                'post_type' => $post_type,
+                'posts_per_page' => -1 // Get all matching posts
+            ));
+            
+            if (!empty($posts)) {
+/**
+ * Excel file processor
+ */
+
+    /**
+     * Process the uploaded Excel file
+     */
+    public function process_excel_file($file_path, $allow_overwrite) {
+        $results = array();
+
+        try {
+            // Set increased time limits for large migrations
+            $this->increase_limits();
+            
+            // Check if file exists
+            if (!file_exists($file_path)) {
+                throw new Exception('File not found');
+            }
+            
+            // Get file info
+            $file_type = mime_content_type($file_path);
+            $file_extension = strtolower(pathinfo($file_path, PATHINFO_EXTENSION));
+            
+            error_log("MIGRATION: Processing file of type $file_type with extension $file_extension");
+            
+            // Process based on file type
+            if ($file_extension === 'csv' || $this->is_csv_file($file_path)) {
+                // Process CSV directly
+                $results = $this->process_csv_file($file_path, $allow_overwrite);
+            } 
+            elseif (
+                $file_extension === 'xlsx' || 
+                $file_type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+                $this->is_xlsx_file($file_path)
+            ) {
+                // Convert XLSX to CSV
+                $csv_file = $this->convert_xlsx_to_csv($file_path);
+                $results = $this->process_csv_file($csv_file, $allow_overwrite);
+                // Clean up temp file
+                if (file_exists($csv_file)) {
+                    unlink($csv_file);
+                }
+            } else {
+                throw new Exception("Unsupported file format: $file_type. Please use .xlsx or .csv files.");
+            }
+        } catch (Exception $e) {
+            error_log("MIGRATION ERROR: " . $e->getMessage());
+            
+            // Free any leftover locks or resources
+            $this->cleanup_after_error();
+            
+            // Add the error to results if possible
+            $results[] = array(
+                'status' => 'error',
+                'message' => $e->getMessage()
+            );
+            
+            throw new Exception($e->getMessage());
+        }
+        
+        return $results;
+    }
+    
+    /**
+     * Increase PHP limits for large migrations
+     */
+    private function increase_limits() {
+        // Increase PHP limits
+        @ini_set('memory_limit', '512M');
+        @ini_set('max_execution_time', '600'); // 5 minutes
+        @set_time_limit(600);
+        
+        // Also increase WordPress-specific limits
+        if (function_exists('wp_raise_memory_limit')) {
+            wp_raise_memory_limit('admin');
+        }
+        
+        // Log current limits
+        error_log("MIGRATION: Memory limit set to " . ini_get('memory_limit'));
+        error_log("MIGRATION: Max execution time set to " . ini_get('max_execution_time') . " seconds");
+        
+        // Disable WordPress revisions temporarily to save resources
+        if (!defined('WP_POST_REVISIONS')) {
+            define('WP_POST_REVISIONS', false);
+        }
+    }
+    
+    /**
+     * Check if a file is a CSV file by examining its content
+     */
+    private function is_csv_file($file_path) {
+        $handle = @fopen($file_path, 'r');
+        if (!$handle) {
+            return false;
+        }
+        
+        // Try to read the first line as CSV
+        $first_line = fgetcsv($handle);
+        fclose($handle);
+        
+        // If we got an array and it has multiple elements, it's likely a CSV file
+        return is_array($first_line) && count($first_line) > 1;
+    }
+    
+    /**
+     * Check if a file is an XLSX file by examining its content
+     */
+    private function is_xlsx_file($file_path) {
+        // XLSX files are ZIP archives with specific content
+        $signature = @file_get_contents($file_path, false, null, 0, 4);
+        
+        // Check for ZIP file signature (PK..)
+        if ($signature === "PK\x03\x04") {
+            try {
+                $zip = new ZipArchive();
+                if ($zip->open($file_path) === true) {
+                    // Check for specific Excel file structure
+                    $xlsx_files = [
+                        '[Content_Types].xml',
+                        'xl/workbook.xml',
+                        'xl/worksheets/sheet1.xml'
+                    ];
+                    
+                    $is_xlsx = true;
+                    foreach ($xlsx_files as $required_file) {
+                        if ($zip->locateName($required_file) === false) {
+                            $is_xlsx = false;
+                            break;
+                        }
+                    }
+                    
+                    $zip->close();
+                    return $is_xlsx;
+                }
+            } catch (Exception $e) {
+                error_log("MIGRATION WARNING: Error checking XLSX file: " . $e->getMessage());
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Convert XLSX to CSV using PhpSpreadsheet if available, otherwise fallback to ZIP approach
+     */
+    private function convert_xlsx_to_csv($xlsx_file) {
+        // Create temporary file for CSV output
+        $temp_csv = tempnam(sys_get_temp_dir(), 'csv_');
+        $temp_dir = null;
+        
+        // Try using PhpSpreadsheet if it's available (better handling of Excel files)
+        if (class_exists('PhpOffice\PhpSpreadsheet\IOFactory')) {
+            try {
+                error_log("MIGRATION: Using PhpSpreadsheet to convert Excel file");
+                $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($xlsx_file);
+                $writer = new \PhpOffice\PhpSpreadsheet\Writer\Csv($spreadsheet);
+                $writer->save($temp_csv);
+                return $temp_csv;
+            } catch (Exception $e) {
+                error_log("MIGRATION WARNING: PhpSpreadsheet failed, falling back to manual conversion. Error: " . $e->getMessage());
+                // Continue to fallback method
+            }
+        }
+        
+        // XLSX files are ZIP archives containing XML files
+        if (!class_exists('ZipArchive')) {
+            throw new Exception('ZipArchive extension is required to process Excel files');
+        }
+        
+        try {
+            error_log("MIGRATION: Using ZipArchive to convert Excel file");
+            // Extract Excel file contents
+            $zip = new ZipArchive();
+            if ($zip->open($xlsx_file) !== true) {
+                throw new Exception('Could not open Excel file');
+            }
+            
+            // Create a temporary directory
+            $temp_dir = tempnam(sys_get_temp_dir(), 'xlsx_');
+            if (file_exists($temp_dir)) {
+                unlink($temp_dir);
+            }
+            mkdir($temp_dir);
+            
+            // Extract files
+            $zip->extractTo($temp_dir);
+            $zip->close();
+            
+            // Load the sheet data
+            $sheet_file = $temp_dir . '/xl/worksheets/sheet1.xml';
+            if (!file_exists($sheet_file)) {
+                throw new Exception('Could not find sheet data in Excel file');
+            }
+            
+            // Load shared strings if available
+            $strings = array();
+            $shared_strings_file = $temp_dir . '/xl/sharedStrings.xml';
+            if (file_exists($shared_strings_file)) {
+                $xml = simplexml_load_file($shared_strings_file);
+                if ($xml && isset($xml->si)) {
+                    foreach ($xml->si as $si) {
+                        $strings[] = (string) $si->t;
+                    }
+                }
+            }
+            
+            // Parse the sheet
+            $sheet = simplexml_load_file($sheet_file);
+            if (!$sheet || !isset($sheet->sheetData)) {
+                throw new Exception('Could not read sheet data from Excel file');
+            }
+            
+            $rows = array();
+            
+            // Get all rows
+            foreach ($sheet->sheetData->row as $row) {
+                $row_index = (int) $row['r'];
+                $cells = array();
+                
+                // Get cells in this row
+                foreach ($row->c as $cell) {
+                    $cell_ref = (string) $cell['r'];
+                    $column = preg_replace('/[0-9]+/', '', $cell_ref);
+                    $col_index = $this->column_letter_to_index($column);
+                    
+                    // Get cell value
+                    $value = '';
+                    if (isset($cell->v)) {
+                        $value = (string) $cell->v;
+                        
+                        // Handle different data types
+                        if (isset($cell['t']) && (string) $cell['t'] === 's' && isset($strings[(int) $value])) {
+                            // Shared string
+                            $value = $strings[(int) $value];
+                        }
+                    }
+                    
+                    $cells[$col_index] = $value;
+                }
+                
+                $rows[$row_index] = $cells;
+            }
+            
+            // Write to CSV
+            $csv = fopen($temp_csv, 'w');
+            ksort($rows);  // Sort by row index
+            
+            foreach ($rows as $row) {
+                // Fill in any blank cells
+                $csv_row = array();
+                $max_col = 0;
+                foreach ($row as $col => $value) {
+                    $max_col = max($max_col, $col);
+                }
+                
+                for ($i = 0; $i <= $max_col; $i++) {
+                    $csv_row[$i] = isset($row[$i]) ? $row[$i] : '';
+                }
+                
+                ksort($csv_row);  // Make sure columns are in order
+                fputcsv($csv, $csv_row);
+            }
+            
+            fclose($csv);
+            
+            // Clean up
+            $this->delete_directory($temp_dir);
+            
+            return $temp_csv;
+        } catch (Exception $e) {
+            // Clean up on error
+            if (isset($temp_dir) && is_dir($temp_dir)) {
+                $this->delete_directory($temp_dir);
+            }
+            throw new Exception('Excel conversion error: ' . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Convert column letter to index (A=0, B=1, etc.)
+     */
+    private function column_letter_to_index($column) {
+        $column = strtoupper($column);
+        $index = 0;
+        for ($i = 0; $i < strlen($column); $i++) {
+            $index = $index * 26 + (ord($column[$i]) - ord('A') + 1);
+        }
+        return $index - 1;
+    }
+    
+    /**
+     * Process CSV file to migrate content
+     */
+    private function process_csv_file($file_path, $allow_overwrite) {
+        if (!file_exists($file_path)) {
+            return array(
+                'status' => 'error',
+                'message' => 'File not found: ' . $file_path
+            );
+        }
+        
+        // Increase PHP time and memory limits
+        $this->increase_limits();
+        
+        // Track processed titles to prevent duplicates within the same import
+        $processed_titles = array();
+        
+        // IMPROVED: Load previously processed URLs to prevent duplicates across sessions
+        $processed_urls = $this->get_processed_urls();
+        error_log("MIGRATION: Loaded " . count($processed_urls) . " previously processed URLs");
+        
+        // Open the CSV file and read rows
+        $handle = fopen($file_path, 'r');
+        if (!$handle) {
+            return array(
+                'status' => 'error',
+                'message' => 'Unable to open file: ' . $file_path
+            );
+        }
+        
+        // Get headers from first row
+        $headers = fgetcsv($handle);
+        if (!$headers || count($headers) < 2) {
+            fclose($handle);
+            return array(
+                'status' => 'error',
+                'message' => 'Invalid CSV format: Missing or invalid headers'
+            );
+        }
+        
+        // Convert header array to associative column indexes
+        $columns = $this->get_column_indexes_from_array($headers);
+        
+        // Check for required columns
+        if (!isset($columns['new_url'])) {
+            fclose($handle);
+            return array(
+                'status' => 'error', 
+                'message' => 'Required column "new_url" is missing in CSV file'
+            );
+        }
+        
+        // Check for MIGRATE column (used to skip rows)
+        $has_migrate_column = isset($columns['migrate']);
+        
+        // Read all rows
+        $rows = array();
+        $row_num = 1; // Start from 1 because headers are row 0
+        
+        while (($row = fgetcsv($handle)) !== false) {
+            $row_num++;
+            
+            // Skip empty rows
+            if (empty($row) || count($row) == 0) {
+                    continue;
+                }
+                
+            // Skip rows with fewer columns than headers
+            if (count($row) < count($headers)) {
+                error_log("MIGRATION WARNING: Row {$row_num} has fewer columns than headers: " . implode(', ', $row));
+                continue;
+            }
+            
+            // If MIGRATE column exists, check if this row should be migrated
+            if ($has_migrate_column) {
+                $migrate_value = trim(isset($row[$columns['migrate']]) ? $row[$columns['migrate']] : '');
+                if (strtoupper($migrate_value) !== 'MIGRATE') {
+                    // Skip this row
+                    continue;
+                }
+            }
+            
+            // Convert CSV row to associative array using column indexes
+                $row_data = array();
+            foreach ($columns as $column_name => $column_index) {
+                if (isset($row[$column_index])) {
+                    $row_data[$column_name] = $row[$column_index];
+                }
+            }
+            
+            // Add to rows array
+            $rows[] = $row_data;
+        }
+        
+        fclose($handle);
+        
+        // Sort rows by hierarchy depth to ensure parents are processed before children
+        $rows = $this->sort_rows_by_hierarchy_depth($rows);
+        
+        // Process each row
+        $results = array(
+            'total' => count($rows),
+            'success' => 0,
+            'skipped' => 0,
+            'error' => 0,
+            'details' => array()
+        );
+        
+        foreach ($rows as $index => $row_data) {
+            // Cache parent IDs for efficiency
+            $row_data = $this->cache_parent_id($row_data, $index, $rows);
+            
+            // Get the new URL for this row
+            $new_url = isset($row_data['new_url']) ? trim($row_data['new_url']) : '';
+            $new_url = '/' . ltrim(trim($new_url), '/');  // Normalize URL format
+            
+            // IMPROVED: Check for already processed URLs from previous imports
+            if (!empty($new_url) && !$allow_overwrite && isset($processed_urls[$new_url])) {
+                $existing_post_id = $processed_urls[$new_url];
+                $existing_post = get_post($existing_post_id);
+                
+                if ($existing_post) {
+                    error_log("MIGRATION: Skipping already processed URL: {$new_url} (Post ID: {$existing_post_id})");
+                    
+                    // Get the title from the row data or existing post
+                    $title = isset($row_data['title']) ? $row_data['title'] : $existing_post->post_title;
+                    
+                    $result = array(
+                        'status' => 'skipped',
+                        'message' => "URL already processed in previous import: {$new_url} (ID: {$existing_post_id})",
+                        'title' => $title,
+                        'slug' => $existing_post->post_name,
+                        'url' => $new_url,
+                        'post_id' => $existing_post_id
+                    );
+                    
+                    $results['skipped']++;
+                    $results['details'][] = array_merge(array('row' => $index + 1, 'url' => $new_url), $result);
+                    continue;  // Skip to next row without processing
+                }
+            }
+            
+            // Continue with the existing duplicate detection
+            if (!empty($new_url) && !$allow_overwrite) {
+                // Extract required info for checking
+                $full_path = ltrim($new_url, '/');
+                $type = isset($row_data['type']) ? strtolower(trim($row_data['type'])) : 'page';
+                $slug = $this->extract_slug($new_url);
+                $title = isset($row_data['title']) ? trim($row_data['title']) : '';
+                
+                // Check for existing post with the exact same path
+                $existing_post = $this->find_existing_post_by_path($full_path, $type);
+                // If not found by path, try to find by slug (similar to process_row logic)
+                if (!$existing_post) {
+                    global $wpdb;
+                    $potential_posts = $wpdb->get_results($wpdb->prepare(
+                        "SELECT ID, post_parent, post_type FROM $wpdb->posts WHERE post_name = %s AND post_type = %s AND post_status IN ('publish', 'draft')",
+                        $slug,
+                        $type
+                    ));
+                    
+                    if (!empty($potential_posts)) {
+                        if ($type === 'post') {
+                            $existing_post = get_post($potential_posts[0]->ID);
+                        } else {
+                            // For pages, check parent relationship
+                            $expected_parent_id = 0;
+                            if (!empty($row_data['parent_url'])) {
+                                $parent_path = ltrim(trim($row_data['parent_url']), '/');
+                                $parent_post = get_page_by_path($parent_path, OBJECT, $type);
+                                if ($parent_post) {
+                                    $expected_parent_id = $parent_post->ID;
+                                }
+                            } else {
+                                $expected_parent_id = $this->determine_parent_by_path($full_path, $type);
+                            }
+                            
+                            foreach ($potential_posts as $page) {
+                                if ((int)$page->post_parent === (int)$expected_parent_id) {
+                                    $existing_post = get_post($page->ID);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // If we found an existing post, add it to processed_urls and skip processing
+                if ($existing_post) {
+                    // Add to our processed URLs list
+                    $processed_urls[$new_url] = $existing_post->ID;
+                    
+                    $existing_path = '';
+                    if ($type === 'page') {
+                        $existing_path = '/' . trim(get_page_uri($existing_post->ID), '/');
+                        
+                        // Skip processing entirely if URLs match exactly for pages
+                        $normalized_new_url = '/' . trim($new_url, '/');
+                        $normalized_existing_path = '/' . trim($existing_path, '/');
+                        
+                        if ($normalized_existing_path === $normalized_new_url) {
+                            error_log("MIGRATION: Early skip - Exact URL match found for page {$new_url}. Skipping processing entirely.");
+                            $result = array(
+                                'status' => 'skipped',
+                                'message' => "Page already exists at exact URL {$new_url}. Skipped.",
+                                'title' => $title ?: ucwords(str_replace('-', ' ', $slug)),
+                                'slug' => $slug,
+                                'url' => $new_url,
+                                'post_id' => $existing_post->ID
+                            );
+                            
+                            $results['skipped']++;
+                            $results['details'][] = array_merge(array('row' => $index + 1, 'url' => $new_url), $result);
+                            continue;  // Skip to next row without calling process_row
+                        }
+                    } else {
+                        // For posts, we check the slug match since permalinks may differ in structure
+                        $existing_slug = get_post_field('post_name', $existing_post->ID);
+                        
+                        // Extract the expected category from the URL for comparison
+                        $expected_category = '';
+                        $url_parts = explode('/', trim($new_url, '/'));
+                        if (!empty($url_parts[0])) {
+                            $expected_category = $url_parts[0];
+                        }
+                        
+                        // Get the post's assigned categories
+                        $post_categories = wp_get_post_categories($existing_post->ID, array('fields' => 'all'));
+                        $category_match = false;
+                        
+                        // Check if this post is in the expected category
+                        if (!empty($expected_category) && !empty($post_categories)) {
+                            foreach ($post_categories as $category) {
+                                if ($category->slug === $expected_category) {
+                                    $category_match = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // If no category in URL or post has no categories, consider it a match
+                            // This prevents duplicate posts with the same slug
+                            $category_match = true;
+                        }
+                        
+                        // Also consider explicit category from CSV if provided
+                        $csv_category = isset($row_data['categories']) ? trim($row_data['categories']) : '';
+                        if (!empty($csv_category) && !empty($post_categories)) {
+                            foreach ($post_categories as $category) {
+                                if (strtolower($category->name) === strtolower($csv_category)) {
+                                    $category_match = true;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Skip if the slug matches and either the category matches or we want to be strict about uniqueness
+                        if ($existing_slug === $slug && $category_match) {
+                            error_log("MIGRATION: Early skip - Post with slug '{$slug}' already exists. Skipping processing entirely.");
+                            $result = array(
+                                'status' => 'skipped',
+                                'message' => "Post with slug '{$slug}' already exists" . (!empty($expected_category) ? " in category '{$expected_category}'" : "") . ". Skipped.",
+                                'title' => $title ?: ucwords(str_replace('-', ' ', $slug)),
+                                'slug' => $slug,
+                                'url' => $new_url,
+                                'post_id' => $existing_post->ID
+                            );
+                            
+                            $results['skipped']++;
+                            $results['details'][] = array_merge(array('row' => $index + 1, 'url' => $new_url), $result);
+                            continue;  // Skip to next row without calling process_row
+                        }
+                    }
+                }
+            }
+            
+            // Process the row
+            $result = $this->process_row($row_data, $allow_overwrite, true);
+            
+            // If successful, add the post to our tracking lists
+            if ($result['status'] === 'success') {
+                // Add title to processed titles
+                $title = isset($row_data['title']) ? trim($row_data['title']) : '';
+                if (!empty($title)) {
+                    $processed_titles[] = $title;
+                }
+                
+                // Add to processed URLs list with post ID
+                if (!empty($new_url) && isset($result['post_id'])) {
+                    $processed_urls[$new_url] = $result['post_id'];
+                    
+                    // Save periodically to avoid losing progress on timeout
+                    if ($index % 5 === 0) {
+                        $this->save_processed_urls($processed_urls);
+                    }
+                    
+                    // Clear WordPress caches immediately after each successful page creation
+                    $this->clear_wpdb_query_cache();
+                    clean_post_cache($result['post_id']);
+                    
+                    // Force a clear of WordPress post caches
+                    global $wpdb;
+                    $wpdb->flush();
+                    wp_cache_flush();
+                    
+                    error_log("MIGRATION: Cleared cache after creating/updating post ID: {$result['post_id']} for URL: {$new_url}");
+                }
+            }
+            
+            // Update statistics
+            if ($result['status'] === 'success') {
+                $results['success']++;
+            } elseif ($result['status'] === 'skipped') {
+                $results['skipped']++;
+            } else {
+                $results['error']++;
+            }
+            
+            // Add to details with row information
+            $row_info = array(
+                'row' => $index + 1,
+                'url' => isset($row_data['new_url']) ? $row_data['new_url'] : 'Unknown'
+            );
+            $results['details'][] = array_merge($row_info, $result);
+            
+            // Clear cache periodically
+            if ($index % 10 === 0) {
+                $this->clear_wpdb_query_cache();
+            }
+        }
+        
+        // Save all processed URLs at the end
         $this->save_processed_urls($processed_urls);
         
         // Final flush of rewrite rules after all posts are created
@@ -2808,7 +4667,7 @@ class Excel_Processor {
         mb_internal_encoding('UTF-8');
         
         // Add XML encoding declaration and wrap in div to help with special characters
-        $wrapped_html = '<?xml encoding="UTF-8"?><div>' . $html . '</div>';
+        $wrapped_html = '<' . 'div>' . $html . '</' . 'div>';
         
         // Load the HTML with UTF-8 support
         $dom->loadHTML($wrapped_html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
@@ -3075,60 +4934,61 @@ class Excel_Processor {
         fputcsv($output, array('# 2. For automatic parent_url generation, paste this formula in column E (parent_url):'));
         fputcsv($output, array('# =IF(LEN(D2)-LEN(SUBSTITUTE(D2,"/",""))<=2, "", LEFT(D2,FIND("~",SUBSTITUTE(D2,"/","~",LEN(D2)-LEN(SUBSTITUTE(D2,"/",""))-1))-1) & "/")'));
         fputcsv($output, array('# 3. For posts, specify ONE category name in the "categories" column (no commas)'));
-        fputcsv($output, array('# 4. After applying formulas, copy the formula column and paste as values before saving as CSV'));
-        fputcsv($output, array('# 5. Delete these instruction rows before importing'));
+        fputcsv($output, array('# 4. The "auto_categories" column (yes/no) determines whether to create categories from URL path segments'));
+        fputcsv($output, array('# 5. After applying formulas, copy the formula column and paste as values before saving as CSV'));
+        fputcsv($output, array('# 6. Delete these instruction rows before importing'));
         fputcsv($output, array('# '));
         
-        // Write header row with the correct column order
+        // Write header row with the requested column order
         fputcsv($output, array(
-            'Migrate', 'Menu Name', 'Old URL', 'New URL', 'parent_url', 'categories', 'Meta Title', 'H1', 'Page/Post Title', 'Type', 'Image'
+            'MIGRATE', 'type', 'old_url', 'new_url', 'parent_url', 'categories', 'auto_categories', 'h1', 'title', 'meta_title', 'featured_image', 'Process Images'
         ));
         
-        // Sample data rows in the correct column order
+        // Sample data rows in the new column order
         // Parent pages
         fputcsv($output, array(
-            'MIGRATE', 'Spartanburg', 'https://example.com/spartanburg', '/spartanburg', '', '', 'Spartanburg | Example Site', 'Spartanburg', 'Spartanburg', 'page', 'Yes'
+            'MIGRATE', 'page', 'https://example.com/spartanburg', '/spartanburg', '', '', 'no', 'Spartanburg', 'Spartanburg', 'Spartanburg | Example Site', 'auto', 'Yes'
         ));
         
         fputcsv($output, array(
-            'MIGRATE', 'Aiken', 'https://example.com/aiken', '/aiken', '', '', 'Aiken | Example Site', 'Aiken', 'Aiken', 'page', 'Yes'
+            'MIGRATE', 'page', 'https://example.com/aiken', '/aiken', '', '', 'no', 'Aiken', 'Aiken', 'Aiken | Example Site', 'auto', 'Yes'
         ));
         
         fputcsv($output, array(
-            'MIGRATE', 'Our Services', 'https://example.com/services', '/services', '', '', 'Professional Services | Example Site', 'Services', 'Our Services', 'page', 'Yes'
+            'MIGRATE', 'page', 'https://example.com/services', '/services', '', '', 'no', 'Services', 'Our Services', 'Professional Services | Example Site', 'Yes', 'Yes'
         ));
         
         // Child pages with parent_url
         fputcsv($output, array(
-            'MIGRATE', 'Car Accident', 'https://example.com/spartanburg/car-accident', '/spartanburg/car-accident', '/spartanburg', '', 'Car Accident | Example Site', 'Car Accident', 'Car Accident', 'page', 'Yes'
+            'MIGRATE', 'page', 'https://example.com/spartanburg/car-accident', '/spartanburg/car-accident', '/spartanburg', '', 'no', 'Car Accident', 'Car Accident', 'Car Accident | Example Site', 'Yes', 'Yes'
         ));
         
         fputcsv($output, array(
-            'MIGRATE', 'Personal Injury', 'https://example.com/aiken/personal-injury', '/aiken/personal-injury', '/aiken', '', 'Personal Injury | Example Site', 'Personal Injury', 'Personal Injury', 'page', 'Yes'
+            'MIGRATE', 'page', 'https://example.com/aiken/personal-injury', '/aiken/personal-injury', '/aiken', '', 'no', 'Personal Injury', 'Personal Injury', 'Personal Injury | Example Site', 'Yes', 'Yes'
         ));
         
         // Deep child page
         fputcsv($output, array(
-            'MIGRATE', 'Aggressive Driving', 'https://example.com/spartanburg/car-accident/aggressive-driving', '/spartanburg/car-accident/aggressive-driving', '/spartanburg/car-accident', '', 'Aggressive Driving | Example Site', 'Aggressive Driving', 'Aggressive Driving', 'page', 'Yes'
+            'MIGRATE', 'page', 'https://example.com/spartanburg/car-accident/aggressive-driving', '/spartanburg/car-accident/aggressive-driving', '/spartanburg/car-accident', '', 'no', 'Aggressive Driving', 'Aggressive Driving', 'Aggressive Driving | Example Site', 'Yes', 'Yes'
         ));
         
         // Blog posts with categories
         fputcsv($output, array(
-            'MIGRATE', 'First Blog Post', 'https://example.com/blog/first-post', '/blog/first-post', '', 'Blog', 'First Blog Post | Example Site', 'First Blog Post', 'First Blog Post', 'post', 'Yes'
+            'MIGRATE', 'post', 'https://example.com/blog/first-post', '/blog/first-post', '', 'Blog', 'no', 'First Blog Post', 'First Blog Post', 'First Blog Post | Example Site', 'https://example.com/images/featured.jpg', 'Yes'
         ));
         
         fputcsv($output, array(
-            'MIGRATE', 'Second Blog Post', 'https://example.com/blog/second-post', '/blog/second-post', '', 'Legal', 'Second Blog Post | Example Site', 'Second Blog Post', 'Second Blog Post', 'post', 'Yes'
+            'MIGRATE', 'post', 'https://example.com/blog/second-post', '/blog/second-post', '', 'Legal', 'no', 'Second Blog Post', 'Second Blog Post', 'Second Blog Post | Example Site', 'Yes', 'Yes'
         ));
         
-        // Post that uses categories from URL
+        // Post that uses auto-categories from URL
         fputcsv($output, array(
-            'MIGRATE', 'Latest Update', 'https://example.com/law/personal-injury/latest-update', '/law/personal-injury/latest-update', '', 'Personal Injury', 'Latest Update | Example Site', 'Latest Update', 'Latest Update', 'post', 'Yes'
+            'MIGRATE', 'post', 'https://example.com/law/personal-injury/latest-update', '/law/personal-injury/latest-update', '', '', 'yes', 'Latest Update', 'Latest Update', 'Latest Update | Example Site', 'Yes', 'Yes'
         ));
         
         // Simple contact page
         fputcsv($output, array(
-            'MIGRATE', 'Contact Our Team', 'https://example.com/contact', '/contact', '', '', 'Contact Our Team | Example Site', 'Contact Us', 'Contact Our Team', 'page', 'No'
+            'MIGRATE', 'page', 'https://example.com/contact', '/contact', '', '', 'no', 'Contact Us', 'Contact Our Team', 'Contact Our Team | Example Site', 'No', 'No'
         ));
         
         // Get the CSV data as a string
@@ -5566,4 +7426,8 @@ class Excel_Processor {
         // Always return false to disable all batch processing functionality
         return false;
     }
+}
+}
+}
+}
 }

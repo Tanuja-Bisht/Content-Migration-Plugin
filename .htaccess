@@ -1,0 +1,3 @@
+# Suppress PHP deprecation warnings
+php_flag display_errors off
+php_value error_reporting 22519 
